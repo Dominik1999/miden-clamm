@@ -63,7 +63,9 @@ export function WalletPanel({
         </p>
       )}
       <p className="clamm-hint">
-        Signed locally in this browser (dev faucet keys from deployment.json).
+        Demo faucets: TKA/TKB are worthless test tokens. Funding mints them
+        with demo faucet keys published in the deployment descriptor, signed
+        locally in this browser.
       </p>
     </div>
   );

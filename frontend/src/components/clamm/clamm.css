@@ -15,6 +15,17 @@
   background: rgba(128, 128, 128, 0.06);
 }
 
+/* Persistent honesty notice (network does not service pool notes). */
+.clamm-notice {
+  border: 1px solid #d4a72c;
+  border-radius: 10px;
+  padding: 0.85rem 1.25rem;
+  background: rgba(212, 167, 44, 0.12);
+  color: inherit;
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
 .clamm-card h3 {
   margin-top: 0;
 }

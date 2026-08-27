@@ -62,6 +62,43 @@ local-net/stop-stack.sh
 The v0.15 node RPC serves gRPC-web with CORS natively — the browser talks
 to `localhost:57291` directly, no proxy.
 
+## Public testnet deployment
+
+The pool is also deployed (by ordinary transaction) on the public Miden
+testnet, and the frontend is hosted on Vercel pointed at it:
+
+```sh
+cargo run -p integration --bin export_web_artifacts --release -- --deploy --network testnet
+cargo run -p integration --bin testnet_smoke --release   # fund, mint, swap through the deployed pool
+```
+
+- `frontend/public/packages/clamm/deployment.testnet.json` is the
+  **committed** descriptor for the shared public-testnet deployment
+  (pool + faucet ids, script roots). The local descriptor
+  (`deployment.json`) stays gitignored because every local stack is
+  different. Production builds select the testnet descriptor via
+  `VITE_CLAMM_DEPLOYMENT_URL` in `frontend/.env.production`; local dev
+  (`yarn dev` + `.env.local`) keeps using `deployment.json`.
+- The faucet secret keys inside the descriptor are **intentional**: TKA/TKB
+  are worthless demo tokens and publishing the keys lets any browser
+  self-fund test balances, exactly like the local dev flow.
+- The testnet RPC (`https://rpc.testnet.miden.io`) serves gRPC-web + CORS
+  to third-party origins and the delegated prover
+  (`https://tx-prover.testnet.miden.io`) proves user-side transactions, so
+  the hosted frontend needs no proxy — only the COOP/COEP headers in
+  `frontend/vercel.json`.
+- **Servicing status (measured 2026-08-27):** the public testnet operator
+  does **not** run an ntx-builder that services arbitrary network accounts.
+  The pool deployed fine by transaction and all user-side transactions
+  (faucet mints, wallet funding, note publishing) commit in ~6-8s, but a
+  committed mint note against the pool was never consumed (600s+
+  observation window). The pool is therefore **deployed but passive** on
+  testnet: the hosted frontend shows live pool state and lets you submit
+  notes, with a persistent notice (`VITE_CLAMM_NTX_PASSIVE`) that notes
+  will sit pending and can be reclaimed after their deadline. Full
+  end-to-end execution runs on the local stack above, whose ntx-builder
+  services the pool within seconds.
+
 ## Status
 
 All phases complete and verified: source-grounded design, math (Rust +

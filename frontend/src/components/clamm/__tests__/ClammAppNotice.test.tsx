@@ -1,7 +1,15 @@
+// Verifies the persistent "network is not servicing pool notes" honesty
+// notice (CLAMM_NTX_PASSIVE, set via VITE_CLAMM_NTX_PASSIVE for the public
+// testnet build): shown on every tab, including the note-submitting swap and
+// positions flows, while pool reads keep rendering.
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
+vi.mock("@/config", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/config")>()),
+  CLAMM_NTX_PASSIVE: true,
+}));
 vi.mock("@/hooks/clamm/useDeployment", () => ({ useDeployment: vi.fn() }));
 vi.mock("@/hooks/clamm/usePoolState", () => ({ usePoolState: vi.fn() }));
 vi.mock("@/hooks/clamm/useClammWallet", () => ({ useClammWallet: vi.fn() }));
@@ -14,11 +22,11 @@ import { useClammWallet } from "@/hooks/clamm/useClammWallet";
 import { useSubmitPoolNote } from "@/hooks/clamm/useSubmitPoolNote";
 import { useNoteLifecycle } from "@/hooks/clamm/useNoteLifecycle";
 import { ClammApp } from "../ClammApp";
-import { DEPLOYMENT, POOL_STATE, WALLET_ID, trackedNote } from "./fixtures";
+import { DEPLOYMENT, POOL_STATE, WALLET_ID } from "./fixtures";
 
-function mockHooks(overrides: { deployment?: typeof DEPLOYMENT | null } = {}) {
+function mockHooks() {
   vi.mocked(useDeployment).mockReturnValue({
-    deployment: overrides.deployment === undefined ? DEPLOYMENT : overrides.deployment,
+    deployment: DEPLOYMENT,
     isLoading: false,
     error: null,
   });
@@ -49,9 +57,7 @@ function mockHooks(overrides: { deployment?: typeof DEPLOYMENT | null } = {}) {
     submitCollect: vi.fn(async () => null),
   });
   vi.mocked(useNoteLifecycle).mockReturnValue({
-    notes: [
-      trackedNote({ id: "0xmint1", kind: "mint", tickLower: -120, tickUpper: 120, liquidity: "5000", status: "processed" }),
-    ],
+    notes: [],
     activity: [],
     currentBlock: 1050,
     isBusy: false,
@@ -62,61 +68,32 @@ function mockHooks(overrides: { deployment?: typeof DEPLOYMENT | null } = {}) {
   });
 }
 
-describe("ClammApp", () => {
+describe("ClammApp ntx-passive notice", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockHooks();
   });
 
-  it("shows deploy instructions when no deployment descriptor exists", () => {
-    mockHooks({ deployment: null });
+  it("shows the persistent notice with the reclaim guidance", () => {
     render(<ClammApp />);
-    expect(screen.getByText("CLAMM pool not deployed")).toBeInTheDocument();
-    expect(screen.getByText(/export_web_artifacts/)).toBeInTheDocument();
+    const notice = screen.getByTestId("ntx-passive-notice");
+    expect(notice).toHaveTextContent(
+      "Miden testnet is not currently executing pool operations",
+    );
+    expect(notice).toHaveTextContent(/sit pending/);
+    expect(notice).toHaveTextContent(/reclaim any pending note/i);
   });
 
-  it("shows the loading state while the descriptor loads", () => {
-    vi.mocked(useDeployment).mockReturnValue({ deployment: null, isLoading: true, error: null });
+  it("keeps the notice visible on the swap flow while pool reads still render", async () => {
     render(<ClammApp />);
-    expect(screen.getByText(/Loading CLAMM deployment/)).toBeInTheDocument();
-  });
-
-  it("shows a malformed-descriptor error", () => {
-    vi.mocked(useDeployment).mockReturnValue({
-      deployment: null,
-      isLoading: false,
-      error: "deployment.pool.id is not a valid account id",
-    });
-    render(<ClammApp />);
-    expect(screen.getByRole("alert")).toHaveTextContent(/Invalid deployment descriptor/);
-  });
-
-  it("renders the wallet panel and the pool tab by default", () => {
-    render(<ClammApp />);
-    expect(screen.getByText("Session wallet")).toBeInTheDocument();
+    // Pool reads still work.
     expect(screen.getByText("TKA / TKB pool")).toBeInTheDocument();
-  });
-
-  it("does not show the ntx-passive notice by default (local network)", () => {
-    render(<ClammApp />);
-    expect(screen.queryByTestId("ntx-passive-notice")).not.toBeInTheDocument();
-  });
-
-  it("switches between tabs", async () => {
-    render(<ClammApp />);
     await userEvent.click(screen.getByRole("button", { name: "Swap" }));
     expect(screen.getByRole("form", { name: "Swap" })).toBeInTheDocument();
+    expect(screen.getByTestId("ntx-passive-notice")).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Positions" }));
     expect(screen.getByText("Add liquidity")).toBeInTheDocument();
-    // Position derived from the tracked mint note.
-    expect(screen.getByText("[-120, 120]")).toBeInTheDocument();
-    expect(screen.getByText("5000")).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: "Notes" }));
-    expect(screen.getByText("Submitted notes")).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: "Activity" }));
-    expect(screen.getByText("Incoming notes")).toBeInTheDocument();
+    expect(screen.getByTestId("ntx-passive-notice")).toBeInTheDocument();
   });
 });

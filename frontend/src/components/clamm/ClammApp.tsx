@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { CLAMM_NTX_PASSIVE } from "@/config";
 import { useDeployment } from "@/hooks/clamm/useDeployment";
 import { usePoolState } from "@/hooks/clamm/usePoolState";
 import { useClammWallet } from "@/hooks/clamm/useClammWallet";
@@ -77,11 +78,11 @@ export function ClammApp() {
         <ol>
           <li>
             Start the local stack:{" "}
-            <code>project-template/local-net/start-stack.sh --fresh</code>
+            <code>local-net/start-stack.sh --fresh</code>
           </li>
           <li>
             Export artifacts + deploy:{" "}
-            <code>cargo run --bin export_web_artifacts --release -- --deploy</code>
+            <code>cargo run -p integration --bin export_web_artifacts --release -- --deploy</code>
           </li>
           <li>
             Point the frontend at the local network:{" "}
@@ -95,6 +96,17 @@ export function ClammApp() {
 
   return (
     <div className="clamm-app">
+      {CLAMM_NTX_PASSIVE && (
+        <div className="clamm-notice" role="status" data-testid="ntx-passive-notice">
+          <strong>Miden testnet is not currently executing pool operations.</strong>{" "}
+          The public testnet does not service this pool with network
+          transactions, so swap / mint / burn / collect notes will sit pending
+          after they commit. Your funds stay recoverable: reclaim any pending
+          note from the Notes tab after its deadline passes. Pool state below
+          is read live from testnet. For full end-to-end execution, run the
+          local stack (see the README quickstart).
+        </div>
+      )}
       <WalletPanel
         deployment={deployment}
         walletId={wallet.walletId}

@@ -46,9 +46,28 @@ export const APP_NAME = "Miden Template";
 // ---------------------------------------------------------------------------
 
 // Deployment descriptor written by the Rust exporter
-// (`cargo run --bin export_web_artifacts --release -- --deploy` in
-// project-template). Contains pool/faucet account ids and network URLs.
-export const CLAMM_DEPLOYMENT_URL = "/packages/clamm/deployment.json";
+// (`cargo run --bin export_web_artifacts --release -- --deploy [--network testnet]`).
+// Contains pool/faucet account ids and network URLs.
+//
+// Which descriptor loads is env-selected:
+//   - default (local dev): `/packages/clamm/deployment.json`, written by the
+//     local `--deploy` run against the local stack (gitignored).
+//   - production build (`.env.production`): VITE_CLAMM_DEPLOYMENT_URL points
+//     at `/packages/clamm/deployment.testnet.json`, the committed public
+//     testnet deployment written by `--deploy --network testnet`.
+export const CLAMM_DEPLOYMENT_URL =
+  import.meta.env.VITE_CLAMM_DEPLOYMENT_URL ?? "/packages/clamm/deployment.json";
+
+// Honesty flag for networks whose operator does NOT run an ntx-builder that
+// services arbitrary network accounts (measured on the public Miden testnet,
+// 2026-08-27: a committed mint note against the deployed pool was never
+// consumed). When set (any non-empty value), the app shows a persistent
+// notice on the note-submitting flows: submitted notes will sit pending and
+// can be reclaimed by their sender after the deadline; pool-state reads are
+// unaffected. Leave unset for the local stack, whose ntx-builder services
+// the pool within seconds.
+export const CLAMM_NTX_PASSIVE: boolean =
+  ((import.meta.env.VITE_CLAMM_NTX_PASSIVE as string | undefined) ?? "") !== "";
 
 // Serialized MASM note scripts (NoteScript bytes), written by the exporter.
 export const CLAMM_SCRIPT_URLS = {
