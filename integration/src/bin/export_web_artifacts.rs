@@ -1,5 +1,5 @@
 //! Exports everything the web frontend needs to build and track CLAMM pool
-//! notes in the browser, into `frontend-template/public/packages/clamm/`.
+//! notes in the browser, into `frontend/public/packages/clamm/`.
 //!
 //! Two modes:
 //!
@@ -14,15 +14,25 @@
 //!     (byte-exact, with note ids), P2ID serial/recipient derivations,
 //!     Poseidon2 position keys, and tick→sqrtPriceX96 vectors.
 //!
-//! * **`--deploy` (requires the local stack at :57291)** — additionally
-//!   deploys two fresh faucets and a fresh MASM pool (empty first-deployment
-//!   transactions) and writes `deployment.json` with the account ids, pool
-//!   parameters, script roots, and the DEV-ONLY faucet secret keys (so the
-//!   browser can mint test tokens to its local wallet).
+//! * **`--deploy`** — additionally deploys two fresh faucets and a fresh
+//!   MASM pool (empty first-deployment transactions) and writes a deployment
+//!   descriptor with the account ids, pool parameters, script roots, and the
+//!   DEMO-ONLY faucet secret keys (so the browser can mint test tokens to
+//!   its local wallet).
+//!
+//!   The target network is selected with `--network <local|testnet>`
+//!   (default `local`):
+//!   - `local` (requires the local stack at :57291) writes `deployment.json`
+//!     (gitignored — every local stack is different).
+//!   - `testnet` deploys to the public Miden testnet
+//!     (`https://rpc.testnet.miden.io`) and writes `deployment.testnet.json`
+//!     (committed — one shared public deployment, loaded by the production
+//!     frontend build via `VITE_CLAMM_DEPLOYMENT_URL`).
 //!
 //! Run from anywhere; paths resolve relative to the integration crate dir:
 //!   cargo run --bin export_web_artifacts --release
 //!   cargo run --bin export_web_artifacts --release -- --deploy
+//!   cargo run --bin export_web_artifacts --release -- --deploy --network testnet
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -64,7 +74,51 @@ const FAUCET_MAX_SUPPLY: u64 = 9_000_000_000_000_000_000;
 const GOLDEN_SERIAL: [u64; 4] = [11, 22, 33, 44];
 
 fn out_dir() -> PathBuf {
-    PathBuf::from("../../frontend-template/public/packages/clamm")
+    PathBuf::from("../frontend/public/packages/clamm")
+}
+
+/// Per-network deployment configuration.
+struct NetworkCfg {
+    name: &'static str,
+    endpoint: Endpoint,
+    /// URLs recorded in the deployment descriptor (informational for the
+    /// frontend; the browser client itself is configured via VITE_ env vars).
+    rpc_url: &'static str,
+    prover_url: &'static str,
+    deployment_file: &'static str,
+    store_path: &'static str,
+    keystore_path: &'static str,
+    /// How long to wait for each deployment tx to be queryable on-chain.
+    confirm_timeout: std::time::Duration,
+}
+
+impl NetworkCfg {
+    fn local() -> Self {
+        NetworkCfg {
+            name: "local",
+            endpoint: Endpoint::new("http".into(), "localhost".into(), Some(57291)),
+            rpc_url: "http://localhost:57291",
+            prover_url: "http://localhost:50051",
+            deployment_file: "deployment.json",
+            store_path: "../local-store-web-deploy.sqlite3",
+            keystore_path: "../local-keystore-web-deploy",
+            confirm_timeout: std::time::Duration::from_secs(120),
+        }
+    }
+
+    fn testnet() -> Self {
+        NetworkCfg {
+            name: "testnet",
+            endpoint: Endpoint::testnet(),
+            rpc_url: "https://rpc.testnet.miden.io",
+            prover_url: "https://tx-prover.testnet.miden.io",
+            deployment_file: "deployment.testnet.json",
+            store_path: "../testnet-store-web-deploy.sqlite3",
+            keystore_path: "../testnet-keystore-web-deploy",
+            // Public testnet: be generous with block cadence.
+            confirm_timeout: std::time::Duration::from_secs(600),
+        }
+    }
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -421,32 +475,31 @@ fn export_offline() -> Result<(AccountId, AccountId, AccountId, AccountId)> {
     Ok((token0, token1, user_id, pool_id))
 }
 
-async fn deploy() -> Result<()> {
+async fn deploy(cfg: &NetworkCfg) -> Result<()> {
     let dir = out_dir();
 
     // Fresh dedicated client state for every deploy.
-    let _ = std::fs::remove_file("../local-store-web-deploy.sqlite3");
-    let _ = std::fs::remove_dir_all("../local-keystore-web-deploy");
+    let _ = std::fs::remove_file(cfg.store_path);
+    let _ = std::fs::remove_dir_all(cfg.keystore_path);
 
-    let endpoint = Endpoint::new("http".into(), "localhost".into(), Some(57291));
-    let rpc: Arc<GrpcClient> = Arc::new(GrpcClient::new(&endpoint, 30_000));
+    let rpc: Arc<GrpcClient> = Arc::new(GrpcClient::new(&cfg.endpoint, 30_000));
     let keystore = Arc::new(
-        FilesystemKeyStore::new(PathBuf::from("../local-keystore-web-deploy"))
+        FilesystemKeyStore::new(PathBuf::from(cfg.keystore_path))
             .context("initializing web-deploy keystore")?,
     );
     let mut client = ClientBuilder::new()
-        .rpc(Arc::new(GrpcClient::new(&endpoint, 30_000)))
-        .sqlite_store(PathBuf::from("../local-store-web-deploy.sqlite3"))
+        .rpc(Arc::new(GrpcClient::new(&cfg.endpoint, 30_000)))
+        .sqlite_store(PathBuf::from(cfg.store_path))
         .authenticator(keystore.clone())
         .in_debug_mode(true.into())
         .build()
         .await
-        .context("building web-deploy client (is the local stack running on :57291?)")?;
+        .with_context(|| format!("building web-deploy client for {} ({})", cfg.name, cfg.rpc_url))?;
     let sync = client
         .sync_state()
         .await
-        .context("initial sync failed (is the local stack running on :57291?)")?;
-    println!("[deploy] connected to local node; chain tip: {}", sync.block_num);
+        .with_context(|| format!("initial sync against {} failed ({})", cfg.name, cfg.rpc_url))?;
+    println!("[deploy] connected to {} node; chain tip: {}", cfg.name, sync.block_num);
 
     let mut rng = RandomCoin::new(Word::from([
         rand::random::<u32>(),
@@ -488,13 +541,18 @@ async fn deploy() -> Result<()> {
         let t0 = std::time::Instant::now();
         loop {
             ensure!(
-                t0.elapsed() < std::time::Duration::from_secs(120),
-                "{label} deployment did not land on-chain within 120s"
+                t0.elapsed() < cfg.confirm_timeout,
+                "{label} deployment did not land on-chain within {:?}",
+                cfg.confirm_timeout
             );
-            client.sync_state().await?;
+            let tip = client.sync_state().await?.block_num;
             if let Ok(Some(acct)) = rpc.get_account_details(id).await {
                 if acct.nonce().as_canonical_u64() >= 1 {
-                    println!("[deploy] {label} on-chain (nonce {})", acct.nonce().as_canonical_u64());
+                    println!(
+                        "[deploy] {label} on-chain (nonce {}, observed at block height {})",
+                        acct.nonce().as_canonical_u64(),
+                        tip
+                    );
                     break;
                 }
             }
@@ -505,13 +563,15 @@ async fn deploy() -> Result<()> {
     let deployment = format!(
         concat!(
             "{{\n",
-            "  \"network\": {{\"rpcUrl\": \"http://localhost:57291\", \"proverUrl\": \"http://localhost:50051\"}},\n",
+            "  \"network\": {{\"rpcUrl\": \"{rpc_url}\", \"proverUrl\": \"{prover_url}\"}},\n",
             "  \"pool\": {{\"id\": \"{pool}\", \"feePips\": {fee}, \"tickSpacing\": {spacing}, \"initialTick\": {tick}}},\n",
             "  \"token0\": {{\"id\": \"{t0}\", \"symbol\": \"TKA\", \"decimals\": 6, \"devSecretKeyHex\": \"{k0}\"}},\n",
             "  \"token1\": {{\"id\": \"{t1}\", \"symbol\": \"TKB\", \"decimals\": 6, \"devSecretKeyHex\": \"{k1}\"}},\n",
             "  \"roots\": {{\"swap\": \"{r_swap}\", \"mint\": \"{r_mint}\", \"burn\": \"{r_burn}\", \"collect\": \"{r_collect}\", \"p2id\": \"{r_p2id}\"}}\n",
             "}}\n"
         ),
+        rpc_url = cfg.rpc_url,
+        prover_url = cfg.prover_url,
         pool = pool.id().to_hex(),
         fee = FEE_PIPS,
         spacing = SPACING,
@@ -526,8 +586,13 @@ async fn deploy() -> Result<()> {
         r_collect = Word::from(note_script(PoolNoteKind::Collect).root()).to_hex(),
         r_p2id = Word::from(P2idNote::script_root()).to_hex(),
     );
-    std::fs::write(dir.join("deployment.json"), deployment).context("writing deployment.json")?;
-    println!("[deploy] deployment.json written to {}", dir.join("deployment.json").display());
+    std::fs::write(dir.join(cfg.deployment_file), deployment)
+        .with_context(|| format!("writing {}", cfg.deployment_file))?;
+    println!(
+        "[deploy] {} written to {}",
+        cfg.deployment_file,
+        dir.join(cfg.deployment_file).display()
+    );
     Ok(())
 }
 
@@ -542,7 +607,20 @@ async fn main() -> Result<()> {
         user.to_hex(), pool.to_hex(), token0.to_hex(), token1.to_hex());
 
     if std::env::args().any(|a| a == "--deploy") {
-        deploy().await?;
+        let args: Vec<String> = std::env::args().collect();
+        let network = args
+            .iter()
+            .position(|a| a == "--network")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str)
+            .unwrap_or("local");
+        let cfg = match network {
+            "local" => NetworkCfg::local(),
+            "testnet" => NetworkCfg::testnet(),
+            other => anyhow::bail!("unknown --network {other} (expected local|testnet)"),
+        };
+        println!("[deploy] target network: {} ({})", cfg.name, cfg.rpc_url);
+        deploy(&cfg).await?;
     } else {
         println!("[export] skipping deployment (pass --deploy with the local stack running to write deployment.json)");
     }

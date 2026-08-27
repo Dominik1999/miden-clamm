@@ -8,4 +8,10 @@ local-net/genesis/
 local-node-data/
 frontend/.env.local
 frontend/public/packages/clamm/deployment.json
+local-store-*.sqlite3
+local-keystore-*/
+testnet-store-*.sqlite3
+testnet-keystore-*/
+local-store.sqlite3
+local-keystore/
 .DS_Store
