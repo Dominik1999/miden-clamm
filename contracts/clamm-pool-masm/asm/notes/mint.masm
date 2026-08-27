@@ -1,0 +1,71 @@
+use miden::protocol::account_id
+use miden::protocol::active_account
+use miden::protocol::active_note
+use miden::protocol::tx
+use miden::standards::wallets::basic->wallet
+use clamm::pool
+
+# AMM mint (add-liquidity) note (MASM port of contracts/amm-note-mint). Note storage
+# layout (9 felts, byte-identical to the Rust note):
+# [pool_id_suffix, pool_id_prefix, tick_lower_off, tick_upper_off,
+#  liq_l0, liq_l1, liq_l2, liq_l3, deadline_height].
+#
+# - Path A (executing account == pool_id): `call` the pool's kernel-read `mint`.
+# - Path B (executing account == sender, block >= deadline): reclaim the max-amount
+#   assets via the standard BasicWallet.
+# - Anyone else: panic.
+
+# CONSTANTS
+# =================================================================================================
+
+const STORAGE_PTR = 0
+const POOL_ID_SUFFIX_ITEM = 0
+const POOL_ID_PREFIX_ITEM = 1
+const DEADLINE_ITEM = 8
+const NUM_STORAGE_ITEMS = 9
+
+# ERRORS
+# =================================================================================================
+
+const ERR_MINT_NOTE_BAD_STORAGE = "AMM mint note expects exactly 9 note storage items"
+const ERR_MINT_NOTE_UNAUTHORIZED = "AMM mint note: wrong pool or unauthorized consumer"
+const ERR_MINT_NOTE_RECLAIM_EARLY = "AMM mint note: reclaim before deadline"
+
+# PROCEDURES
+# =================================================================================================
+
+#! AMM mint note script: dispatches to the pool's kernel-read `mint` procedure when
+#! consumed by the pool, or reclaims the assets to the sender's standard BasicWallet
+#! at/after the deadline.
+#!
+#! Inputs:  []
+#! Outputs: []
+#!
+#! Panics if:
+#! - the note storage does not hold exactly 9 items.
+#! - the consumer is neither the targeted pool nor the note sender.
+#! - the sender reclaims before the deadline height.
+@note_script
+pub proc main
+    push.STORAGE_PTR exec.active_note::get_storage
+    eq.NUM_STORAGE_ITEMS assert.err=ERR_MINT_NOTE_BAD_STORAGE
+
+    mem_load.POOL_ID_PREFIX_ITEM mem_load.POOL_ID_SUFFIX_ITEM
+    exec.active_account::get_id
+    exec.account_id::is_equal
+    if.true
+        # Path A: the pool executes; everything is kernel-read inside the pool
+        padw padw padw padw
+        call.pool::mint
+        dropw dropw dropw dropw
+    else
+        # Path B: sender reclaim, only at/after the deadline
+        exec.active_note::get_sender
+        exec.active_account::get_id
+        exec.account_id::is_equal assert.err=ERR_MINT_NOTE_UNAUTHORIZED
+        mem_load.DEADLINE_ITEM
+        exec.tx::get_block_number
+        lte assert.err=ERR_MINT_NOTE_RECLAIM_EARLY
+        exec.wallet::add_assets_to_account
+    end
+end

@@ -1,0 +1,16 @@
+diff --git a/bin/ntx-builder/src/lib.rs b/bin/ntx-builder/src/lib.rs
+index a44b62d..d7509ea 100644
+--- a/bin/ntx-builder/src/lib.rs
++++ b/bin/ntx-builder/src/lib.rs
+@@ -459,7 +459,10 @@ impl NtxBuilderConfig {
+         let actor_context = AccountActorContext {
+             clients: GrpcClients {
+                 rpc,
+-                prover: RemoteTransactionProver::new(self.tx_prover_url.as_str()),
++                // PHASE4 PATCH: the client's default per-request timeout is 10s,
++                // far below the proving time of multi-megacycle network txs.
++                prover: RemoteTransactionProver::new(self.tx_prover_url.as_str())
++                    .with_timeout(Duration::from_secs(7200)),
+             },
+             state: State {
+                 db,

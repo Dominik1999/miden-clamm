@@ -1,0 +1,17 @@
+[package]
+name = "amm-math"
+version = "0.1.0"
+edition = "2021"
+description = "no_std fixed-point AMM math for a Uniswap-v3-style pool on Miden (Q64.96 sqrt prices, u64 liquidity)"
+
+[lib]
+# Plain rlib: this crate is consumed by Phase 2 contract crates and by host-side tests.
+crate-type = ["rlib"]
+
+[dependencies]
+# Intentionally empty: the library is no_std, no-alloc, zero-dependency.
+
+[dev-dependencies]
+proptest = "1"
+primitive-types = "0.13"
+uint = "0.10"

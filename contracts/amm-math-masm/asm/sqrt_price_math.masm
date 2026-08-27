@@ -1,0 +1,445 @@
+use amm::math::wide
+use miden::core::math::u128
+
+# Port of Uniswap v3 SqrtPriceMath on u128 / limb arithmetic, keeping Uniswap's
+# rounding directions (every rounding favors the pool).
+#
+# Port of contracts/amm-math/src/sqrt_price_math.rs (the verified Rust oracle):
+# sqrt prices are Q64.96 in u128 over ticks +/-443,636 and liquidity is u128. Wide
+# intermediates (up to ~352 bits) go through amm::math::wide; where Uniswap needs a
+# uint256-overflow fallback formula, the exact-denominator formula is computed on limbs.
+#
+# u128 values are 4 little-endian u32 limbs, limb 0 on top of the stack.
+
+# CONSTANTS
+# =================================================================================================
+
+# Sqrt price domain (Q64.96 in u128), same values as amm::math::tick_math
+const MIN_SQRT_L0 = 0x4EA15D28
+const MIN_SQRT_L1 = 0x00013B50
+const MIN_SQRT_L2 = 0x00000001
+const MIN_SQRT_L3 = 0x00000000
+const MAX_SQRT_L0 = 0xFB40724A
+const MAX_SQRT_L1 = 0xA81B33B5
+const MAX_SQRT_L2 = 0x35BB7F32
+const MAX_SQRT_L3 = 0xFFFEC4B1
+
+# get_amount0_delta memory locals
+const A0D_LO_LOC = 0        # lower sqrt price (0..3)
+const A0D_HI_LOC = 4        # upper sqrt price (4..7)
+const A0D_L_LOC = 8         # liquidity (8..11)
+const A0D_NUM_LOC = 12      # numerator (L * delta) << 96, 11 limbs + spill (12..23)
+const A0D_NUM3_LOC = 15
+const A0D_Q1_LOC = 24       # step-1 quotient, 11 limbs (24..34)
+const A0D_U2_LOC = 36       # step-2 dividend, 11 limbs + spill (36..47)
+const A0D_Q2_LOC = 48       # step-2 quotient, 11 limbs (48..58)
+const A0D_Q2_HI_LOC = 52    # upper 7 limbs of the step-2 quotient
+const A0D_DELTA_LOC = 60    # hi - lo (60..63)
+const A0D_RUP_LOC = 64      # round_up flag
+
+# get_amount1_delta memory locals
+const A1D_LO_LOC = 0
+const A1D_HI_LOC = 4
+const A1D_L_LOC = 8
+const A1D_DELTA_LOC = 12
+const A1D_PROD_LOC = 16     # L * delta, 8 limbs (16..23)
+const A1D_PROD0_LOC = 16
+const A1D_PROD1_LOC = 17
+const A1D_PROD2_LOC = 18
+const A1D_PROD3_LOC = 19
+const A1D_PROD4_LOC = 20
+const A1D_PROD5_LOC = 21
+const A1D_PROD6_LOC = 22
+const A1D_PROD7_LOC = 23
+const A1D_RUP_LOC = 24
+
+# next_from_amount0 memory locals
+const NFA0_P_LOC = 0        # sqrt price (0..3)
+const NFA0_L_LOC = 4        # liquidity (4..7)
+const NFA0_AMT_LOC = 8      # amount (8..11)
+const NFA0_NUM_LOC = 12     # (L * sqrt_p) << 96, 11 limbs + spill (12..23)
+const NFA0_NUM3_LOC = 15
+const NFA0_PROD_LOC = 24    # amount * sqrt_p, 8 limbs (24..31)
+const NFA0_DEN_LOC = 32     # denominator, 9 limbs (32..40)
+const NFA0_DEN8_LOC = 40
+const NFA0_LSH_LOC = 44     # L << 96, 8 limbs (44..51)
+const NFA0_LSH3_LOC = 47
+const NFA0_LSH7_LOC = 51
+const NFA0_Q_LOC = 52       # quotient, 11 limbs (52..62)
+const NFA0_Q_HI_LOC = 56    # upper 7 limbs of the quotient
+const NFA0_ADD_LOC = 63     # add flag
+
+# next_from_amount1 memory locals
+const NFA1_P_LOC = 0        # sqrt price (0..3)
+const NFA1_L_LOC = 4        # liquidity (4..7)
+const NFA1_U_LOC = 8        # amount << 96, 8 limbs + spill (8..16)
+const NFA1_U3_LOC = 11
+const NFA1_U4_LOC = 12
+const NFA1_U5_LOC = 13
+const NFA1_U6_LOC = 14
+const NFA1_U7_LOC = 15
+const NFA1_U8_LOC = 16
+const NFA1_Q_LOC = 20       # quotient, 8 limbs (20..27)
+const NFA1_Q_HI_LOC = 24    # upper 4 limbs of the quotient
+const NFA1_ADD_LOC = 28     # add flag
+
+# ERRORS
+# =================================================================================================
+
+const ERR_SQRT_PRICE_OUT_OF_RANGE = "sqrt_price_math: sqrt price out of supported range"
+const ERR_AMOUNT0_REMOVAL_EXCEEDS_RESERVES = "sqrt_price_math: amount0 removal exceeds reserves"
+const ERR_AMOUNT1_OVERFLOW = "sqrt_price_math: amount1 overflow"
+const ERR_PRICE_OVERFLOW = "sqrt_price_math: price overflow"
+const ERR_PRICE_UNDERFLOW = "sqrt_price_math: price underflow"
+const ERR_ZERO_LIQUIDITY = "sqrt_price_math: zero liquidity"
+const ERR_MUL_DIV_QUOTIENT_OVERFLOW = "mul_div: quotient overflow"
+
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Computes the amount of token0 spanned by [min(a,b), max(a,b)] at the given liquidity:
+#! amount0 = L * 2^96 * (sqrt_b - sqrt_a) / (sqrt_b * sqrt_a), in Uniswap's two division
+#! steps with round-up applied at both steps when round_up is set.
+#!
+#! Rounding: up when round_up (what a user owes the pool), down otherwise (what the pool
+#! pays out) — both directions favor the pool.
+#!
+#! Inputs:  [sa0, sa1, sa2, sa3, sb0, sb1, sb2, sb3, l0, l1, l2, l3, round_up]
+#! Outputs: [amount0_0, amount0_1, amount0_2, amount0_3]
+#!
+#! Where:
+#! - sa0..sa3 are the 32-bit limbs of sqrt price a (sa0 least significant).
+#! - sb0..sb3 are the 32-bit limbs of sqrt price b (sb0 least significant).
+#! - l0..l3 are the 32-bit limbs of the liquidity (l0 least significant).
+#! - round_up is 1 to round up, 0 to round down.
+#! - amount0_0..amount0_3 are the 32-bit limbs of the token0 amount.
+#!
+#! Panics if:
+#! - either price is outside the supported range.
+#! - the result does not fit in u128.
+#!
+#! Invocation: exec
+@locals(68)
+pub proc get_amount0_delta(sqrt_a: u128, sqrt_b: u128, liquidity: u128, round_up: i1) -> u128
+    dupw exec.assert_in_range
+    dupw.1 exec.assert_in_range
+
+    # sort: flag = (sb <= sa); hi = max, lo = min
+    dupw.1 dupw.1 exec.u128::lte
+    if.true
+        loc_storew_le.A0D_HI_LOC dropw
+        loc_storew_le.A0D_LO_LOC dropw
+    else
+        loc_storew_le.A0D_LO_LOC dropw
+        loc_storew_le.A0D_HI_LOC dropw
+    end
+    loc_storew_le.A0D_L_LOC dropw
+    loc_store.A0D_RUP_LOC
+    # => []
+
+    # zero result when liquidity == 0 or lo == hi
+    padw loc_loadw_le.A0D_L_LOC exec.u128::eqz
+    padw loc_loadw_le.A0D_LO_LOC padw loc_loadw_le.A0D_HI_LOC exec.u128::eq
+    or
+    if.true
+        push.0 push.0 push.0 push.0
+    else
+        # delta = hi - lo
+        padw loc_loadw_le.A0D_HI_LOC padw loc_loadw_le.A0D_LO_LOC exec.u128::wrapping_sub
+        loc_storew_le.A0D_DELTA_LOC dropw
+
+        # numerator = (L * delta) << 96 (11 limbs)
+        push.3 locaddr.A0D_NUM_LOC exec.wide::zero_limbs
+        push.4 locaddr.A0D_DELTA_LOC push.4 locaddr.A0D_L_LOC locaddr.A0D_NUM3_LOC
+        exec.wide::mul_limbs_ptr
+
+        # step 1: q1 = numerator / hi, rounded per flag
+        loc_load.A0D_RUP_LOC
+        push.4 locaddr.A0D_HI_LOC push.11 locaddr.A0D_NUM_LOC locaddr.A0D_Q1_LOC
+        exec.wide::div_round_ptr
+
+        # step 2: q2 = q1 / lo, rounded per flag; must fit u128
+        push.11 locaddr.A0D_Q1_LOC locaddr.A0D_U2_LOC exec.wide::copy_limbs
+        loc_load.A0D_RUP_LOC
+        push.4 locaddr.A0D_LO_LOC push.11 locaddr.A0D_U2_LOC locaddr.A0D_Q2_LOC
+        exec.wide::div_round_ptr
+        push.7 locaddr.A0D_Q2_HI_LOC exec.wide::sig_limbs
+        eq.0 assert.err=ERR_MUL_DIV_QUOTIENT_OVERFLOW
+
+        padw loc_loadw_le.A0D_Q2_LOC
+    end
+end
+
+#! Computes the amount of token1 spanned by [min(a,b), max(a,b)] at the given liquidity:
+#! amount1 = L * (sqrt_b - sqrt_a) / 2^96.
+#!
+#! Rounding: up when round_up (owed to the pool), down otherwise (paid by the pool).
+#!
+#! Inputs:  [sa0, sa1, sa2, sa3, sb0, sb1, sb2, sb3, l0, l1, l2, l3, round_up]
+#! Outputs: [amount1_0, amount1_1, amount1_2, amount1_3]
+#!
+#! Where:
+#! - sa0..sa3 are the 32-bit limbs of sqrt price a (sa0 least significant).
+#! - sb0..sb3 are the 32-bit limbs of sqrt price b (sb0 least significant).
+#! - l0..l3 are the 32-bit limbs of the liquidity (l0 least significant).
+#! - round_up is 1 to round up, 0 to round down.
+#! - amount1_0..amount1_3 are the 32-bit limbs of the token1 amount.
+#!
+#! Panics if:
+#! - either price is outside the supported range.
+#! - the result does not fit in u128.
+#!
+#! Invocation: exec
+@locals(28)
+pub proc get_amount1_delta(sqrt_a: u128, sqrt_b: u128, liquidity: u128, round_up: i1) -> u128
+    dupw exec.assert_in_range
+    dupw.1 exec.assert_in_range
+
+    dupw.1 dupw.1 exec.u128::lte
+    if.true
+        loc_storew_le.A1D_HI_LOC dropw
+        loc_storew_le.A1D_LO_LOC dropw
+    else
+        loc_storew_le.A1D_LO_LOC dropw
+        loc_storew_le.A1D_HI_LOC dropw
+    end
+    loc_storew_le.A1D_L_LOC dropw
+    loc_store.A1D_RUP_LOC
+    # => []
+
+    # p = L * (hi - lo) (8 limbs)
+    padw loc_loadw_le.A1D_HI_LOC padw loc_loadw_le.A1D_LO_LOC exec.u128::wrapping_sub
+    loc_storew_le.A1D_DELTA_LOC dropw
+    push.4 locaddr.A1D_DELTA_LOC push.4 locaddr.A1D_L_LOC locaddr.A1D_PROD_LOC
+    exec.wide::mul_limbs_ptr
+
+    # p must be < 2^224 so that p >> 96 fits u128
+    loc_load.A1D_PROD7_LOC eq.0 assert.err=ERR_AMOUNT1_OVERFLOW
+
+    # q = p >> 96 (limbs 3..6); remainder = limbs 0..2
+    loc_load.A1D_PROD0_LOC loc_load.A1D_PROD1_LOC add loc_load.A1D_PROD2_LOC add neq.0
+    loc_load.A1D_RUP_LOC and
+    # => [do_round]
+
+    loc_load.A1D_PROD6_LOC loc_load.A1D_PROD5_LOC loc_load.A1D_PROD4_LOC loc_load.A1D_PROD3_LOC
+    # => [q0, q1, q2, q3, do_round]
+
+    movup.4
+    if.true
+        push.0 push.0 push.0 push.1
+        exec.u128::overflowing_add
+        assertz.err=ERR_AMOUNT1_OVERFLOW
+    end
+    # => [q0, q1, q2, q3]
+end
+
+#! Computes the next sqrt price given an input amount of token0 (zero_for_one) or
+#! token1 (not zero_for_one).
+#!
+#! Rounding (Uniswap getNextSqrtPriceFromInput): the returned price always rounds so
+#! the swap consumes at most amount_in — both directions favor the pool.
+#!
+#! Inputs:  [p0, p1, p2, p3, l0, l1, l2, l3, a0, a1, a2, a3, zero_for_one]
+#! Outputs: [q0, q1, q2, q3]
+#!
+#! Where:
+#! - p0..p3 are the 32-bit limbs of the current sqrt price (p0 least significant).
+#! - l0..l3 are the 32-bit limbs of the liquidity (l0 least significant).
+#! - a0..a3 are the 32-bit limbs of the input amount (a0 least significant).
+#! - zero_for_one is 1 when the input is token0 (price falls), 0 for token1 (price rises).
+#! - q0..q3 are the 32-bit limbs of the next sqrt price.
+#!
+#! Panics if:
+#! - the price is out of range, liquidity is zero, or the result under/overflows u128.
+#!
+#! Invocation: exec
+pub proc get_next_sqrt_price_from_input(sqrt_p: u128, liquidity: u128, amount_in: u128, zero_for_one: i1) -> u128
+    dupw exec.assert_in_range
+    dupw.1 exec.u128::eqz assertz.err=ERR_ZERO_LIQUIDITY
+    movup.12
+    if.true
+        push.1 movdn.12
+        exec.next_from_amount0
+    else
+        push.1 movdn.12
+        exec.next_from_amount1
+    end
+end
+
+#! Computes the next sqrt price given an output amount of token1 (zero_for_one) or
+#! token0 (not zero_for_one).
+#!
+#! Rounding (Uniswap getNextSqrtPriceFromOutput): the returned price always rounds so
+#! the swap delivers at least amount_out — both directions favor the pool.
+#!
+#! Inputs:  [p0, p1, p2, p3, l0, l1, l2, l3, a0, a1, a2, a3, zero_for_one]
+#! Outputs: [q0, q1, q2, q3]
+#!
+#! Where:
+#! - p0..p3 are the 32-bit limbs of the current sqrt price (p0 least significant).
+#! - l0..l3 are the 32-bit limbs of the liquidity (l0 least significant).
+#! - a0..a3 are the 32-bit limbs of the requested output amount (a0 least significant).
+#! - zero_for_one is 1 when the output is token1 (price falls), 0 for token0 (price rises).
+#! - q0..q3 are the 32-bit limbs of the next sqrt price.
+#!
+#! Panics if:
+#! - the price is out of range, liquidity is zero, the requested output exceeds the
+#!   reserves implied by the liquidity, or the result under/overflows u128.
+#!
+#! Invocation: exec
+pub proc get_next_sqrt_price_from_output(sqrt_p: u128, liquidity: u128, amount_out: u128, zero_for_one: i1) -> u128
+    dupw exec.assert_in_range
+    dupw.1 exec.u128::eqz assertz.err=ERR_ZERO_LIQUIDITY
+    movup.12
+    if.true
+        push.0 movdn.12
+        exec.next_from_amount1
+    else
+        push.0 movdn.12
+        exec.next_from_amount0
+    end
+end
+
+# HELPER PROCEDURES
+# =================================================================================================
+
+#! Asserts that a sqrt price lies in [MIN_SQRT_RATIO, MAX_SQRT_RATIO] (inclusive).
+#!
+#! Inputs:  [p0, p1, p2, p3]
+#! Outputs: []
+#!
+#! Where:
+#! - p0..p3 are the 32-bit limbs of the sqrt price (p0 least significant).
+#!
+#! Panics if:
+#! - the price is outside the supported range.
+#!
+#! Invocation: exec
+proc assert_in_range(sqrt_p: u128)
+    dupw
+    push.MIN_SQRT_L3 push.MIN_SQRT_L2 push.MIN_SQRT_L1 push.MIN_SQRT_L0
+    exec.u128::gte assert.err=ERR_SQRT_PRICE_OUT_OF_RANGE
+    push.MAX_SQRT_L3 push.MAX_SQRT_L2 push.MAX_SQRT_L1 push.MAX_SQRT_L0
+    exec.u128::lte assert.err=ERR_SQRT_PRICE_OUT_OF_RANGE
+end
+
+#! Computes the next sqrt price after adding (add == 1) or removing (add == 0) an
+#! amount of token0: sqrt_q = ceil(L * 2^96 * sqrt_p / (L * 2^96 +/- amount * sqrt_p)),
+#! always with the exact denominator on limbs.
+#!
+#! Inputs:  [p0, p1, p2, p3, l0, l1, l2, l3, a0, a1, a2, a3, add]
+#! Outputs: [q0, q1, q2, q3]
+#!
+#! Panics if:
+#! - removing and amount * sqrt_p >= L << 96 (insufficient reserves).
+#! - the result does not fit in u128.
+#!
+#! Invocation: exec
+@locals(64)
+proc next_from_amount0(sqrt_p: u128, liquidity: u128, amount: u128, add_flag: i1) -> u128
+    loc_storew_le.NFA0_P_LOC dropw
+    loc_storew_le.NFA0_L_LOC dropw
+    # => [a0, a1, a2, a3, add]
+
+    dupw exec.u128::eqz
+    if.true
+        # zero amount: price is unchanged
+        dropw drop
+        padw loc_loadw_le.NFA0_P_LOC
+    else
+        loc_storew_le.NFA0_AMT_LOC dropw
+        loc_store.NFA0_ADD_LOC
+
+        # product = amount * sqrt_p (8 limbs)
+        push.4 locaddr.NFA0_P_LOC push.4 locaddr.NFA0_AMT_LOC locaddr.NFA0_PROD_LOC
+        exec.wide::mul_limbs_ptr
+
+        # numerator = (L * sqrt_p) << 96 (11 limbs)
+        push.3 locaddr.NFA0_NUM_LOC exec.wide::zero_limbs
+        push.4 locaddr.NFA0_P_LOC push.4 locaddr.NFA0_L_LOC locaddr.NFA0_NUM3_LOC
+        exec.wide::mul_limbs_ptr
+
+        # L << 96 (8 limbs)
+        push.3 locaddr.NFA0_LSH_LOC exec.wide::zero_limbs
+        push.4 locaddr.NFA0_L_LOC locaddr.NFA0_LSH3_LOC exec.wide::copy_limbs
+        push.0 locaddr.NFA0_LSH7_LOC mem_store
+
+        loc_load.NFA0_ADD_LOC
+        if.true
+            # denominator = product + (L << 96)
+            push.8 locaddr.NFA0_PROD_LOC locaddr.NFA0_DEN_LOC exec.wide::copy_limbs
+            push.0 locaddr.NFA0_DEN8_LOC mem_store
+            push.8 locaddr.NFA0_LSH_LOC push.9 locaddr.NFA0_DEN_LOC exec.wide::add_prop
+        else
+            # removal requires (L << 96) > product
+            push.8 locaddr.NFA0_PROD_LOC locaddr.NFA0_LSH_LOC exec.wide::cmp_limbs
+            eq.2 assert.err=ERR_AMOUNT0_REMOVAL_EXCEEDS_RESERVES
+            # denominator = (L << 96) - product
+            push.8 locaddr.NFA0_LSH_LOC locaddr.NFA0_DEN_LOC exec.wide::copy_limbs
+            push.0 locaddr.NFA0_DEN8_LOC mem_store
+            push.8 locaddr.NFA0_PROD_LOC locaddr.NFA0_DEN_LOC exec.wide::sub_limbs_ptr
+        end
+
+        # q = ceil(numerator / denominator); must fit u128
+        push.1
+        push.9 locaddr.NFA0_DEN_LOC push.11 locaddr.NFA0_NUM_LOC locaddr.NFA0_Q_LOC
+        exec.wide::div_round_ptr
+        push.7 locaddr.NFA0_Q_HI_LOC exec.wide::sig_limbs
+        eq.0 assert.err=ERR_MUL_DIV_QUOTIENT_OVERFLOW
+
+        padw loc_loadw_le.NFA0_Q_LOC
+    end
+end
+
+#! Computes the next sqrt price after adding (add == 1) or removing (add == 0) an
+#! amount of token1: sqrt_q = sqrt_p +/- amount * 2^96 / L, with the quotient rounded
+#! down when adding and up when removing.
+#!
+#! Inputs:  [p0, p1, p2, p3, l0, l1, l2, l3, a0, a1, a2, a3, add]
+#! Outputs: [q0, q1, q2, q3]
+#!
+#! Panics if:
+#! - the quotient does not fit in u128, or the price under/overflows.
+#!
+#! Invocation: exec
+@locals(32)
+proc next_from_amount1(sqrt_p: u128, liquidity: u128, amount: u128, add_flag: i1) -> u128
+    loc_storew_le.NFA1_P_LOC dropw
+    loc_storew_le.NFA1_L_LOC dropw
+    # => [a0, a1, a2, a3, add]
+
+    # shifted = amount << 96 (8 limbs: zero low 3, amount at 3..6, zero limb 7 + spill)
+    push.3 locaddr.NFA1_U_LOC exec.wide::zero_limbs
+    locaddr.NFA1_U3_LOC mem_store
+    locaddr.NFA1_U4_LOC mem_store
+    locaddr.NFA1_U5_LOC mem_store
+    locaddr.NFA1_U6_LOC mem_store
+    push.0 locaddr.NFA1_U7_LOC mem_store
+    push.0 locaddr.NFA1_U8_LOC mem_store
+    loc_store.NFA1_ADD_LOC
+    # => []
+
+    # q = shifted / L, rounded down when adding and up when removing; must fit u128
+    loc_load.NFA1_ADD_LOC not
+    push.4 locaddr.NFA1_L_LOC push.8 locaddr.NFA1_U_LOC locaddr.NFA1_Q_LOC
+    exec.wide::div_round_ptr
+    push.4 locaddr.NFA1_Q_HI_LOC exec.wide::sig_limbs
+    eq.0 assert.err=ERR_MUL_DIV_QUOTIENT_OVERFLOW
+
+    loc_load.NFA1_ADD_LOC
+    if.true
+        padw loc_loadw_le.NFA1_Q_LOC
+        padw loc_loadw_le.NFA1_P_LOC
+        exec.u128::overflowing_add
+        assertz.err=ERR_PRICE_OVERFLOW
+    else
+        padw loc_loadw_le.NFA1_P_LOC
+        padw loc_loadw_le.NFA1_Q_LOC
+        exec.u128::gt
+        assert.err=ERR_PRICE_UNDERFLOW
+        padw loc_loadw_le.NFA1_P_LOC
+        padw loc_loadw_le.NFA1_Q_LOC
+        exec.u128::wrapping_sub
+    end
+    # => [q0, q1, q2, q3]
+end

@@ -1,0 +1,59 @@
+use miden::protocol::account_id
+use miden::protocol::active_account
+use miden::protocol::active_note
+use clamm::pool
+
+# AMM collect note (MASM port of contracts/amm-note-collect). Carries no assets.
+# Note storage layout (4 felts, byte-identical to the Rust note):
+# [pool_id_suffix, pool_id_prefix, tick_lower_off, tick_upper_off].
+#
+# - Path A (executing account == pool_id): `call` the pool's kernel-read `collect`.
+# - Path B (executing account == sender): no-op cleanup — no assets, no deadline.
+# - Anyone else: panic.
+
+# CONSTANTS
+# =================================================================================================
+
+const STORAGE_PTR = 0
+const POOL_ID_SUFFIX_ITEM = 0
+const POOL_ID_PREFIX_ITEM = 1
+const NUM_STORAGE_ITEMS = 4
+
+# ERRORS
+# =================================================================================================
+
+const ERR_COLLECT_NOTE_BAD_STORAGE = "AMM collect note expects exactly 4 note storage items"
+const ERR_COLLECT_NOTE_UNAUTHORIZED = "AMM collect note: wrong pool or unauthorized consumer"
+
+# PROCEDURES
+# =================================================================================================
+
+#! AMM collect note script: dispatches to the pool's kernel-read `collect` procedure
+#! when consumed by the pool; the sender may consume the note as a no-op cleanup.
+#!
+#! Inputs:  []
+#! Outputs: []
+#!
+#! Panics if:
+#! - the note storage does not hold exactly 4 items.
+#! - the consumer is neither the targeted pool nor the note sender.
+@note_script
+pub proc main
+    push.STORAGE_PTR exec.active_note::get_storage
+    eq.NUM_STORAGE_ITEMS assert.err=ERR_COLLECT_NOTE_BAD_STORAGE
+
+    mem_load.POOL_ID_PREFIX_ITEM mem_load.POOL_ID_SUFFIX_ITEM
+    exec.active_account::get_id
+    exec.account_id::is_equal
+    if.true
+        # Path A: the pool executes; everything is kernel-read inside the pool
+        padw padw padw padw
+        call.pool::collect
+        dropw dropw dropw dropw
+    else
+        # Path B: sender cleanup no-op (no assets to move)
+        exec.active_note::get_sender
+        exec.active_account::get_id
+        exec.account_id::is_equal assert.err=ERR_COLLECT_NOTE_UNAUTHORIZED
+    end
+end

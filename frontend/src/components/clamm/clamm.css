@@ -1,0 +1,158 @@
+.clamm-app {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  width: min(720px, 100%);
+  margin: 0 auto;
+  text-align: left;
+}
+
+.clamm-card {
+  border: 1px solid rgba(128, 128, 128, 0.35);
+  border-radius: 10px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1rem;
+  background: rgba(128, 128, 128, 0.06);
+}
+
+.clamm-card h3 {
+  margin-top: 0;
+}
+
+.clamm-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.clamm-stats dt {
+  font-size: 0.8rem;
+  opacity: 0.7;
+}
+
+.clamm-stats dd {
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.clamm-tabs {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.clamm-tab {
+  padding: 0.4rem 1rem;
+}
+
+.clamm-tab-active {
+  border-color: #646cff;
+  background: rgba(100, 108, 255, 0.15);
+}
+
+.clamm-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 0.75rem;
+  flex: 1;
+}
+
+.clamm-field-row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.clamm-field label {
+  font-size: 0.85rem;
+  opacity: 0.8;
+}
+
+.clamm-field input,
+.clamm-field select {
+  padding: 0.45rem 0.6rem;
+  border-radius: 6px;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.clamm-hint {
+  font-size: 0.8rem;
+  opacity: 0.65;
+  overflow-wrap: anywhere;
+}
+
+.clamm-quote {
+  font-size: 0.9rem;
+}
+
+.clamm-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.clamm-table th,
+.clamm-table td {
+  text-align: left;
+  padding: 0.4rem 0.5rem;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+}
+
+.clamm-table button {
+  margin-right: 0.4rem;
+  padding: 0.25rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+.clamm-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.clamm-status {
+  padding: 0.15rem 0.55rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  border: 1px solid rgba(128, 128, 128, 0.4);
+}
+
+.clamm-status-pending {
+  border-color: #d4a72c;
+  color: #d4a72c;
+}
+
+.clamm-status-filled,
+.clamm-status-processed {
+  border-color: #3fb950;
+  color: #3fb950;
+}
+
+.clamm-status-refunded,
+.clamm-status-reclaimable {
+  border-color: #f0883e;
+  color: #f0883e;
+}
+
+.clamm-status-reclaimed {
+  border-color: #8b949e;
+  color: #8b949e;
+}
+
+.clamm-setup ol {
+  padding-left: 1.2rem;
+}
+
+.clamm-setup code {
+  display: inline-block;
+  background: rgba(128, 128, 128, 0.15);
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  margin: 0.1rem 0;
+  overflow-wrap: anywhere;
+}

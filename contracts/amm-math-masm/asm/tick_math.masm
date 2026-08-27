@@ -1,0 +1,745 @@
+use amm::math::wide
+use miden::core::math::u128
+
+# Tick <-> sqrt-price conversion (Uniswap v3 TickMath, Q64.96 in u128).
+#
+# Port of contracts/amm-math/src/tick_math.rs (the verified Rust oracle). Supported tick
+# range is +/-443,636 (DESIGN.md Part 3): every sqrt ratio fits Q64.96 in u128.
+#
+# Tick encoding: this module takes and returns offset-encoded ticks,
+# `tick_off = tick + 2^19` (the pool storage encoding from DESIGN.md Part 2), so ticks
+# are natural u32 numbers: tick 0 is 524288, MIN_TICK is 80652, MAX_TICK is 967924.
+# The Rust oracle takes a signed i32; test harnesses convert with `tick + 524288`.
+#
+# The forward mapping is Uniswap's multiplicative bit decomposition over the 19 per-bit
+# Q0.128 constants below (identical, limb for limb, to the Rust TICK_BIT_CONSTANTS —
+# asserted by the constant-parity test). The reverse mapping is the log2-based
+# Uniswap algorithm (msb + 14 fixed-point square-and-shift steps), not a binary search;
+# the two tick candidates are resolved against this module's own forward function, and
+# the log constants are offset so all arithmetic stays unsigned (see below).
+
+# CONSTANTS
+# =================================================================================================
+
+# Tick offset encoding
+const TICK_OFFSET = 524288          # 2^19; tick_off = tick + TICK_OFFSET
+const OFF_MIN_TICK = 80652          # MIN_TICK (-443636) offset-encoded
+const OFF_MAX_TICK = 967924         # MAX_TICK (+443636) offset-encoded
+const OFF_MAX_TICK_M1 = 967923      # MAX_TICK - 1 offset-encoded
+
+# Sqrt price domain, Q64.96 in u128 as 4 little-endian u32 limbs
+# MIN_SQRT_RATIO = 18_447_090_764_788_882_728 = get_sqrt_ratio_at_tick(MIN_TICK)
+const MIN_SQRT_L0 = 0x4EA15D28
+const MIN_SQRT_L1 = 0x00013B50
+const MIN_SQRT_L2 = 0x00000001
+const MIN_SQRT_L3 = 0x00000000
+# MAX_SQRT_RATIO = 340_275_971_719_517_849_884_101_479_065_584_693_834
+#                = get_sqrt_ratio_at_tick(MAX_TICK)
+const MAX_SQRT_L0 = 0xFB40724A
+const MAX_SQRT_L1 = 0xA81B33B5
+const MAX_SQRT_L2 = 0x35BB7F32
+const MAX_SQRT_L3 = 0xFFFEC4B1
+
+# Per-bit multiplicative constants C[i] = round(2^128 / sqrt(1.0001)^(2^i)) as Q0.128
+# fractions, 4 little-endian u32 limbs each. Bit-for-bit identical to the Rust oracle's
+# TICK_BIT_CONSTANTS table (contracts/amm-math/src/tick_math.rs); the parity test
+# tick_constants_match_rust_oracle drives tick_bit_constant against the Rust table.
+const TICK_C00_L0 = 0x1A594001
+const TICK_C00_L1 = 0xAA2D162D
+const TICK_C00_L2 = 0xBD6FAD37
+const TICK_C00_L3 = 0xFFFCB933
+const TICK_C01_L0 = 0x580E213A
+const TICK_C01_L1 = 0x59A46990
+const TICK_C01_L2 = 0x373D4132
+const TICK_C01_L3 = 0xFFF97272
+const TICK_C02_L0 = 0xF3C7FDCC
+const TICK_C02_L1 = 0xEF12357C
+const TICK_C02_L2 = 0x5F656932
+const TICK_C02_L3 = 0xFFF2E50F
+const TICK_C03_L0 = 0xA0941CD0
+const TICK_C03_L1 = 0x1C3624EA
+const TICK_C03_L2 = 0x7E10E4E6
+const TICK_C03_L3 = 0xFFE5CACA
+const TICK_C04_L0 = 0x5C926644
+const TICK_C04_L1 = 0xC9DB5883
+const TICK_C04_L2 = 0xD60F6159
+const TICK_C04_L3 = 0xFFCB9843
+const TICK_C05_L0 = 0xDFB254C0
+const TICK_C05_L1 = 0x472E6896
+const TICK_C05_L2 = 0xFA98C081
+const TICK_C05_L3 = 0xFF973B41
+const TICK_C06_L0 = 0x26B52861
+const TICK_C06_L1 = 0x43EC78B3
+const TICK_C06_L2 = 0x66C96A38
+const TICK_C06_L3 = 0xFF2EA164
+const TICK_C07_L0 = 0x969C3053
+const TICK_C07_L1 = 0x11C461F1
+const TICK_C07_L2 = 0x6A99A2A8
+const TICK_C07_L3 = 0xFE5DEE04
+const TICK_C08_L0 = 0x479AA3A4
+const TICK_C08_L1 = 0xDCFFC83B
+const TICK_C08_L2 = 0x900A88AE
+const TICK_C08_L3 = 0xFCBE86C7
+const TICK_C09_L0 = 0xF7815E54
+const TICK_C09_L1 = 0x6F2B074C
+const TICK_C09_L2 = 0x3AC41317
+const TICK_C09_L3 = 0xF987A725
+const TICK_C10_L0 = 0x8E4B70F3
+const TICK_C10_L1 = 0x940C7A39
+const TICK_C10_L2 = 0x22B70005
+const TICK_C10_L3 = 0xF3392B08
+const TICK_C11_L0 = 0xA6E889D9
+const TICK_C11_L1 = 0x43B29C7F
+const TICK_C11_L2 = 0xA2C29B74
+const TICK_C11_L3 = 0xE7159475
+const TICK_C12_L0 = 0x92AA5825
+const TICK_C12_L1 = 0x845AD8F7
+const TICK_C12_L2 = 0xFD2022B8
+const TICK_C12_L3 = 0xD097F3BD
+const TICK_C13_L0 = 0x90E061E5
+const TICK_C13_L1 = 0x8A65DC1F
+const TICK_C13_L2 = 0x2D870FDF
+const TICK_C13_L3 = 0xA9F74646
+const TICK_C14_L0 = 0x2BAF32F7
+const TICK_C14_L1 = 0x90BB3DF6
+const TICK_C14_L2 = 0x56D2A1B8
+const TICK_C14_L3 = 0x70D869A1
+const TICK_C15_L0 = 0x542FCFA6
+const TICK_C15_L1 = 0x81231505
+const TICK_C15_L2 = 0x97D08FD9
+const TICK_C15_L3 = 0x31BE135F
+const TICK_C16_L0 = 0xF3E99BC9
+const TICK_C16_L1 = 0xC677DE54
+const TICK_C16_L2 = 0x5B7A84E1
+const TICK_C16_L3 = 0x09AA508B
+const TICK_C17_L0 = 0x225EE604
+const TICK_C17_L1 = 0x6699C329
+const TICK_C17_L2 = 0xDEDB8119
+const TICK_C17_L3 = 0x005D6AF8
+const TICK_C18_L0 = 0x1BEDFE98
+const TICK_C18_L1 = 0x1EA92604
+const TICK_C18_L2 = 0xE584F5FA
+const TICK_C18_L3 = 0x00002216
+
+# Reverse-mapping log constants. Uniswap's getTickAtSqrtRatio computes
+#   log_2 = (msb(ratio) - 128) << 64  |  14 fractional bits (Q64.64, signed)
+#   log_sqrt10001 = log_2 * K,  K = 255738958999603826347141
+#   tick_low  = (log_sqrt10001 - 3402992956809132418596140100660247210) >> 128
+#   tick_high = (log_sqrt10001 + 291339464771989622907027621153398088495) >> 128
+# We keep everything unsigned by tracking log_off = log_2 + 2^69 (>= 0 because
+# msb(ratio) >= 96 on our domain) and folding the offsets into precomputed constants:
+#   tick_low_off  = (log_off * K + A1) >> 128,  A1 = 2^19*2^128 - C1 - 2^69*K
+#   tick_high_off = (log_off * K + A2) >> 128,  A2 = 2^19*2^128 + C2 - 2^69*K
+# which yields the candidates directly in offset encoding (verified >= 0; 145 bits).
+const LOG_K_L0 = 0x55774C85
+const LOG_K_L1 = 0xA301D710
+const LOG_K_L2 = 0x00003627
+const LOG_A1_L0 = 0x62FFC556
+const LOG_A1_L1 = 0xA50FED5E
+const LOG_A1_L2 = 0xA5976B05
+const LOG_A1_L3 = 0x9D35B973
+const LOG_A1_L4 = 0x00013B0B
+const LOG_A2_L0 = 0x99A0632F
+const LOG_A2_L1 = 0x455E2607
+const LOG_A2_L2 = 0xD2AC09E1
+const LOG_A2_L3 = 0x7AF30E93
+const LOG_A2_L4 = 0x00013B0C
+
+# get_sqrt_ratio_at_tick memory locals
+const FWD_RATIO_LOC = 0     # Q128.128 ratio, 5 limbs (0..4)
+const FWD_RATIO0_LOC = 0
+const FWD_RATIO1_LOC = 1
+const FWD_RATIO2_LOC = 2
+const FWD_RATIO3_LOC = 3
+const FWD_RATIO4_LOC = 4
+const FWD_PROD_LOC = 8      # per-bit product (9 limbs) / inversion dividend + spill (8..16)
+const FWD_Q_LOC = 20        # inversion quotient, 8 limbs (20..27)
+const FWD_C_LOC = 28        # staged bit constant (28..31)
+const FWD_C0_LOC = 28
+const FWD_C1_LOC = 29
+const FWD_C2_LOC = 30
+const FWD_C3_LOC = 31
+
+# get_tick_at_sqrt_ratio memory locals
+const REV_X_LOC = 0         # input sqrt price (0..3)
+const REV_R_LOC = 4         # normalized mantissa r in [2^127, 2^128) (4..7)
+const REV_R0_LOC = 4
+const REV_R1_LOC = 5
+const REV_R2_LOC = 6
+const REV_R3_LOC = 7
+const REV_SQ_LOC = 8        # r^2, 8 limbs (8..15)
+const REV_SQ3_LOC = 11
+const REV_SQ4_LOC = 12
+const REV_SQ7_LOC = 15
+const REV_L1_LOC = 16       # log_off limb 1 (bits 32..63)
+const REV_L2_LOC = 17       # log_off limb 2 (bits 64..95)
+const REV_M_LOC = 18        # msb index of the input
+const REV_P_LOC = 20        # log_off * K, 7 limbs (20..26)
+const REV_LOGOFF_LOC = 28   # log_off as 4-limb array (28..31)
+const REV_K_LOC = 32        # K constant, 3 limbs (32..34)
+const REV_SUM_LOC = 36      # P + A, 6 limbs (36..41)
+const REV_SUM4_LOC = 40
+const REV_A_LOC = 44        # A1 / A2 constant, 6 limbs (44..49)
+const REV_THI_LOC = 50      # tick_hi candidate (offset-encoded)
+const REV_TLO_LOC = 51      # tick_lo candidate (offset-encoded)
+
+# ERRORS
+# =================================================================================================
+
+const ERR_TICK_OUT_OF_RANGE = "tick_math: tick out of range"
+const ERR_SQRT_RATIO_OUT_OF_RANGE = "tick_math: sqrt ratio out of range"
+
+# PROCEDURES
+# =================================================================================================
+
+#! Returns sqrt(1.0001^tick) * 2^96 as Q64.96 in u128.
+#!
+#! Algorithm (Uniswap TickMath.getSqrtRatioAtTick): start from ratio = 2^128
+#! (Q128.128 "1.0"); for each set bit i of |tick| multiply by the per-bit constant
+#! C[i], keeping the high 256 bits of the product (truncating, as Uniswap does); if
+#! tick > 0 invert via floor((2^256 - 1) / ratio); finally shift Q128.128 -> Q64.96 by
+#! 32 bits, rounding up if any shifted-out bit is set.
+#!
+#! Inputs:  [tick_off]
+#! Outputs: [x0, x1, x2, x3]
+#!
+#! Where:
+#! - tick_off is the offset-encoded tick (tick + 524288), in [80652, 967924].
+#! - x0..x3 are the 32-bit limbs of sqrtPriceX96 (x0 least significant).
+#!
+#! Panics if:
+#! - tick_off is not a valid u32 or is outside [OFF_MIN_TICK, OFF_MAX_TICK].
+#!
+#! Invocation: exec
+@locals(32)
+pub proc get_sqrt_ratio_at_tick(tick_off: u32) -> u128
+    u32assert
+    dup u32gte.OFF_MIN_TICK assert.err=ERR_TICK_OUT_OF_RANGE
+    dup u32lte.OFF_MAX_TICK assert.err=ERR_TICK_OUT_OF_RANGE
+
+    # sign and magnitude
+    dup u32gt.TICK_OFFSET
+    if.true
+        sub.TICK_OFFSET push.1
+    else
+        push.TICK_OFFSET swap sub push.0
+    end
+    swap
+    # => [abs_tick, is_pos]
+
+    dup eq.0
+    if.true
+        # tick 0: exactly 2^96
+        drop drop
+        push.1 push.0 push.0 push.0
+        # => [0, 0, 0, 1] reading limbs x0..x3
+    else
+        # ratio = 2^128 (Q128.128), 5 limbs
+        push.5 locaddr.FWD_RATIO_LOC exec.wide::zero_limbs
+        push.1 locaddr.FWD_RATIO4_LOC mem_store
+
+        # bit 0
+        dup push.1 u32and
+        if.true
+            push.TICK_C00_L0 loc_store.FWD_C0_LOC
+            push.TICK_C00_L1 loc_store.FWD_C1_LOC
+            push.TICK_C00_L2 loc_store.FWD_C2_LOC
+            push.TICK_C00_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 1
+        dup push.1 u32and
+        if.true
+            push.TICK_C01_L0 loc_store.FWD_C0_LOC
+            push.TICK_C01_L1 loc_store.FWD_C1_LOC
+            push.TICK_C01_L2 loc_store.FWD_C2_LOC
+            push.TICK_C01_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 2
+        dup push.1 u32and
+        if.true
+            push.TICK_C02_L0 loc_store.FWD_C0_LOC
+            push.TICK_C02_L1 loc_store.FWD_C1_LOC
+            push.TICK_C02_L2 loc_store.FWD_C2_LOC
+            push.TICK_C02_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 3
+        dup push.1 u32and
+        if.true
+            push.TICK_C03_L0 loc_store.FWD_C0_LOC
+            push.TICK_C03_L1 loc_store.FWD_C1_LOC
+            push.TICK_C03_L2 loc_store.FWD_C2_LOC
+            push.TICK_C03_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 4
+        dup push.1 u32and
+        if.true
+            push.TICK_C04_L0 loc_store.FWD_C0_LOC
+            push.TICK_C04_L1 loc_store.FWD_C1_LOC
+            push.TICK_C04_L2 loc_store.FWD_C2_LOC
+            push.TICK_C04_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 5
+        dup push.1 u32and
+        if.true
+            push.TICK_C05_L0 loc_store.FWD_C0_LOC
+            push.TICK_C05_L1 loc_store.FWD_C1_LOC
+            push.TICK_C05_L2 loc_store.FWD_C2_LOC
+            push.TICK_C05_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 6
+        dup push.1 u32and
+        if.true
+            push.TICK_C06_L0 loc_store.FWD_C0_LOC
+            push.TICK_C06_L1 loc_store.FWD_C1_LOC
+            push.TICK_C06_L2 loc_store.FWD_C2_LOC
+            push.TICK_C06_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 7
+        dup push.1 u32and
+        if.true
+            push.TICK_C07_L0 loc_store.FWD_C0_LOC
+            push.TICK_C07_L1 loc_store.FWD_C1_LOC
+            push.TICK_C07_L2 loc_store.FWD_C2_LOC
+            push.TICK_C07_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 8
+        dup push.1 u32and
+        if.true
+            push.TICK_C08_L0 loc_store.FWD_C0_LOC
+            push.TICK_C08_L1 loc_store.FWD_C1_LOC
+            push.TICK_C08_L2 loc_store.FWD_C2_LOC
+            push.TICK_C08_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 9
+        dup push.1 u32and
+        if.true
+            push.TICK_C09_L0 loc_store.FWD_C0_LOC
+            push.TICK_C09_L1 loc_store.FWD_C1_LOC
+            push.TICK_C09_L2 loc_store.FWD_C2_LOC
+            push.TICK_C09_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 10
+        dup push.1 u32and
+        if.true
+            push.TICK_C10_L0 loc_store.FWD_C0_LOC
+            push.TICK_C10_L1 loc_store.FWD_C1_LOC
+            push.TICK_C10_L2 loc_store.FWD_C2_LOC
+            push.TICK_C10_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 11
+        dup push.1 u32and
+        if.true
+            push.TICK_C11_L0 loc_store.FWD_C0_LOC
+            push.TICK_C11_L1 loc_store.FWD_C1_LOC
+            push.TICK_C11_L2 loc_store.FWD_C2_LOC
+            push.TICK_C11_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 12
+        dup push.1 u32and
+        if.true
+            push.TICK_C12_L0 loc_store.FWD_C0_LOC
+            push.TICK_C12_L1 loc_store.FWD_C1_LOC
+            push.TICK_C12_L2 loc_store.FWD_C2_LOC
+            push.TICK_C12_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 13
+        dup push.1 u32and
+        if.true
+            push.TICK_C13_L0 loc_store.FWD_C0_LOC
+            push.TICK_C13_L1 loc_store.FWD_C1_LOC
+            push.TICK_C13_L2 loc_store.FWD_C2_LOC
+            push.TICK_C13_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 14
+        dup push.1 u32and
+        if.true
+            push.TICK_C14_L0 loc_store.FWD_C0_LOC
+            push.TICK_C14_L1 loc_store.FWD_C1_LOC
+            push.TICK_C14_L2 loc_store.FWD_C2_LOC
+            push.TICK_C14_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 15
+        dup push.1 u32and
+        if.true
+            push.TICK_C15_L0 loc_store.FWD_C0_LOC
+            push.TICK_C15_L1 loc_store.FWD_C1_LOC
+            push.TICK_C15_L2 loc_store.FWD_C2_LOC
+            push.TICK_C15_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 16
+        dup push.1 u32and
+        if.true
+            push.TICK_C16_L0 loc_store.FWD_C0_LOC
+            push.TICK_C16_L1 loc_store.FWD_C1_LOC
+            push.TICK_C16_L2 loc_store.FWD_C2_LOC
+            push.TICK_C16_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 17
+        dup push.1 u32and
+        if.true
+            push.TICK_C17_L0 loc_store.FWD_C0_LOC
+            push.TICK_C17_L1 loc_store.FWD_C1_LOC
+            push.TICK_C17_L2 loc_store.FWD_C2_LOC
+            push.TICK_C17_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+
+        # bit 18
+        dup push.1 u32and
+        if.true
+            push.TICK_C18_L0 loc_store.FWD_C0_LOC
+            push.TICK_C18_L1 loc_store.FWD_C1_LOC
+            push.TICK_C18_L2 loc_store.FWD_C2_LOC
+            push.TICK_C18_L3 loc_store.FWD_C3_LOC
+            locaddr.FWD_C_LOC locaddr.FWD_PROD_LOC locaddr.FWD_RATIO_LOC
+            exec.ratio_mul_step
+        end
+        u32shr.1
+        # => [abs_tick = 0, is_pos]
+
+        drop
+        # => [is_pos]
+
+        if.true
+            # ratio = floor((2^256 - 1) / ratio)
+            locaddr.FWD_PROD_LOC
+            repeat.8
+                push.0xFFFFFFFF dup.1 mem_store add.1
+            end
+            drop
+            push.5 locaddr.FWD_RATIO_LOC push.8 locaddr.FWD_PROD_LOC locaddr.FWD_Q_LOC
+            exec.wide::div_rem_ptr
+            drop
+            push.5 locaddr.FWD_Q_LOC locaddr.FWD_RATIO_LOC exec.wide::copy_limbs
+        end
+
+        # Q128.128 -> Q64.96: shift right by 32, rounding up
+        loc_load.FWD_RATIO0_LOC neq.0
+        # => [round_up]
+
+        loc_load.FWD_RATIO4_LOC loc_load.FWD_RATIO3_LOC loc_load.FWD_RATIO2_LOC loc_load.FWD_RATIO1_LOC
+        # => [x0, x1, x2, x3, round_up]
+
+        movup.4
+        if.true
+            push.0 push.0 push.0 push.1
+            exec.u128::wrapping_add
+        end
+        # => [x0, x1, x2, x3]
+    end
+end
+
+#! Returns the offset-encoded tick t such that
+#! get_sqrt_ratio_at_tick(t) <= x < get_sqrt_ratio_at_tick(t + 1).
+#!
+#! Algorithm (Uniswap TickMath.getTickAtSqrtRatio, log2-based — not a binary search):
+#! normalize the Q128.128 ratio to a mantissa r in [2^127, 2^128), extract 14
+#! fractional log2 bits by repeated squaring, scale by K = log2 -> tick, derive the
+#! two candidate ticks from precomputed error bounds, and resolve by evaluating the
+#! forward mapping at the upper candidate. All arithmetic is unsigned via the offset
+#! encoding (see the log-constant comment above).
+#!
+#! The result is exact with respect to this module's tick -> ratio mapping (verified
+#! against the Rust oracle's binary-search reverse mapping over dense and adversarial
+#! samples).
+#!
+#! Inputs:  [x0, x1, x2, x3]
+#! Outputs: [tick_off]
+#!
+#! Where:
+#! - x0..x3 are the 32-bit limbs of sqrtPriceX96 (x0 least significant).
+#! - tick_off is the offset-encoded tick (tick + 524288), in [80652, 967923].
+#!
+#! Panics if:
+#! - x is outside [MIN_SQRT_RATIO, MAX_SQRT_RATIO) (Uniswap's half-open input domain).
+#!
+#! Invocation: exec
+@locals(52)
+pub proc get_tick_at_sqrt_ratio(sqrt_price: u128) -> u32
+    loc_storew_le.REV_X_LOC
+
+    # domain: MIN_SQRT_RATIO <= x < MAX_SQRT_RATIO
+    dupw
+    push.MIN_SQRT_L3 push.MIN_SQRT_L2 push.MIN_SQRT_L1 push.MIN_SQRT_L0
+    exec.u128::gte assert.err=ERR_SQRT_RATIO_OUT_OF_RANGE
+    dupw
+    push.MAX_SQRT_L3 push.MAX_SQRT_L2 push.MAX_SQRT_L1 push.MAX_SQRT_L0
+    exec.u128::lt assert.err=ERR_SQRT_RATIO_OUT_OF_RANGE
+
+    # m = 127 - clz(x); x > 2^64 on the domain, so m in [64, 127]
+    dupw exec.u128::clz
+    push.127 swap sub
+    dup loc_store.REV_M_LOC
+    # => [m, x0, x1, x2, x3]
+
+    # normalize the Q128.128 ratio (x << 32) to r in [2^127, 2^128):
+    # r = (x << 32) >> (msb_r - 127) with msb_r = m + 32 simplifies to x << (127 - m)
+    # for the whole domain (m in [64, 127])
+    push.127 swap sub exec.u128::shl
+    loc_storew_le.REV_R_LOC dropw
+    # => []
+
+    # log_off = log_2 + 2^69 starts as (m - 64) << 64
+    loc_load.REV_M_LOC sub.64 loc_store.REV_L2_LOC
+    push.0 loc_store.REV_L1_LOC
+
+    # 14 square-and-shift iterations, k = 63 down to 50:
+    #   r = r^2 >> 127; f = bit 128 of r; log bit k = f; r >>= f
+    # bit 63 (2^(63-32) = 0x80000000)
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x80000000
+    exec.log_step
+    # bit 62
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x40000000
+    exec.log_step
+    # bit 61
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x20000000
+    exec.log_step
+    # bit 60
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x10000000
+    exec.log_step
+    # bit 59
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x08000000
+    exec.log_step
+    # bit 58
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x04000000
+    exec.log_step
+    # bit 57
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x02000000
+    exec.log_step
+    # bit 56
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x01000000
+    exec.log_step
+    # bit 55
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x00800000
+    exec.log_step
+    # bit 54
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x00400000
+    exec.log_step
+    # bit 53
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x00200000
+    exec.log_step
+    # bit 52
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x00100000
+    exec.log_step
+    # bit 51
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x00080000
+    exec.log_step
+    # bit 50
+    locaddr.REV_L1_LOC locaddr.REV_SQ_LOC locaddr.REV_R_LOC push.0x00040000
+    exec.log_step
+
+    # P = log_off * K (7-limb buffer; P < 2^148)
+    push.0 loc_store.REV_LOGOFF_LOC
+    loc_load.REV_L1_LOC loc_store.29
+    loc_load.REV_L2_LOC loc_store.30
+    push.0 loc_store.31
+    push.LOG_K_L0 loc_store.32
+    push.LOG_K_L1 loc_store.33
+    push.LOG_K_L2 loc_store.34
+    push.3 locaddr.REV_K_LOC push.4 locaddr.REV_LOGOFF_LOC locaddr.REV_P_LOC
+    exec.wide::mul_limbs_ptr
+
+    # tick_hi_off = (P + A2) >> 128, clamped to OFF_MAX_TICK
+    push.6 locaddr.REV_P_LOC locaddr.REV_SUM_LOC exec.wide::copy_limbs
+    push.LOG_A2_L0 loc_store.44
+    push.LOG_A2_L1 loc_store.45
+    push.LOG_A2_L2 loc_store.46
+    push.LOG_A2_L3 loc_store.47
+    push.LOG_A2_L4 loc_store.48
+    push.0 loc_store.49
+    push.6 locaddr.REV_A_LOC push.6 locaddr.REV_SUM_LOC exec.wide::add_prop
+    loc_load.REV_SUM4_LOC
+    dup u32gt.OFF_MAX_TICK
+    if.true
+        drop push.OFF_MAX_TICK
+    end
+    loc_store.REV_THI_LOC
+
+    # tick_lo_off = (P + A1) >> 128, clamped to [OFF_MIN_TICK, OFF_MAX_TICK - 1]
+    push.6 locaddr.REV_P_LOC locaddr.REV_SUM_LOC exec.wide::copy_limbs
+    push.LOG_A1_L0 loc_store.44
+    push.LOG_A1_L1 loc_store.45
+    push.LOG_A1_L2 loc_store.46
+    push.LOG_A1_L3 loc_store.47
+    push.LOG_A1_L4 loc_store.48
+    push.0 loc_store.49
+    push.6 locaddr.REV_A_LOC push.6 locaddr.REV_SUM_LOC exec.wide::add_prop
+    loc_load.REV_SUM4_LOC
+    dup u32lt.OFF_MIN_TICK
+    if.true
+        drop push.OFF_MIN_TICK
+    end
+    dup u32gt.OFF_MAX_TICK_M1
+    if.true
+        drop push.OFF_MAX_TICK_M1
+    end
+    loc_store.REV_TLO_LOC
+
+    # resolve: tick_lo when the candidates agree, else pick by evaluating the forward
+    # mapping at tick_hi (Uniswap's two-candidate resolution)
+    loc_load.REV_THI_LOC loc_load.REV_TLO_LOC eq
+    if.true
+        loc_load.REV_TLO_LOC
+    else
+        loc_load.REV_THI_LOC exec.get_sqrt_ratio_at_tick
+        # => [rh0, rh1, rh2, rh3]
+
+        padw loc_loadw_le.REV_X_LOC
+        exec.u128::lte
+        # => [ratio_hi <= x]
+
+        if.true
+            loc_load.REV_THI_LOC
+        else
+            loc_load.REV_TLO_LOC
+        end
+    end
+    # => [tick_off]
+end
+
+# HELPER PROCEDURES
+# =================================================================================================
+
+#! Multiplies the 5-limb Q128.128 ratio in get_sqrt_ratio_at_tick's frame by the staged
+#! 4-limb constant, keeping the high 256 bits: ratio = (ratio * C) >> 128.
+#!
+#! Operates on the caller-provided buffers; all pointers are explicit stack inputs.
+#!
+#! Inputs:  [ratio_ptr, prod_ptr, c_ptr]
+#! Outputs: []
+#!
+#! Where:
+#! - ratio_ptr is the memory address of the 5-limb ratio (updated in place).
+#! - prod_ptr is the memory address of a 9-limb scratch product buffer.
+#! - c_ptr is the memory address of the staged 4-limb per-bit constant.
+#!
+#! Invocation: exec
+@locals(3)
+proc ratio_mul_step(ratio_ptr: u32, prod_ptr: u32, c_ptr: u32)
+    loc_store.0
+    loc_store.1
+    loc_store.2
+    push.4 loc_load.2 push.5 loc_load.0 loc_load.1
+    exec.wide::mul_limbs_ptr
+    push.5 loc_load.1 add.4 loc_load.0 exec.wide::copy_limbs
+end
+
+#! One square-and-shift iteration of the reverse mapping's fractional log2 extraction:
+#!   r' = r^2 >> 127; f = bit 128 of r'; log bit = f; r = r' >> f.
+#!
+#! Operates on caller-provided buffers; all pointers are explicit stack inputs.
+#!
+#! Inputs:  [bit_value, r_ptr, sq_ptr, l1_ptr]
+#! Outputs: []
+#!
+#! Where:
+#! - bit_value is 2^(k-32), added to the log_off accumulator limb when the log bit is set.
+#! - r_ptr is the memory address of the 4-limb mantissa r (updated in place).
+#! - sq_ptr is the memory address of an 8-limb scratch square buffer.
+#! - l1_ptr is the memory address of the log_off accumulator limb (bits 32..63).
+#!
+#! Invocation: exec
+@locals(4)
+proc log_step(bit_value: u32, r_ptr: u32, sq_ptr: u32, l1_ptr: u32)
+    loc_store.0
+    loc_store.1
+    loc_store.2
+    loc_store.3
+
+    # sq = r * r
+    push.4 loc_load.1 push.4 loc_load.1 loc_load.2
+    exec.wide::mul_limbs_ptr
+
+    # f = bit 255 of sq (= bit 128 of sq >> 127)
+    loc_load.2 add.7 mem_load u32shr.31
+    if.true
+        # r = sq >> 128; log_off += bit_value
+        push.4 loc_load.2 add.4 loc_load.1 exec.wide::copy_limbs
+        loc_load.3 dup mem_load loc_load.0 add swap mem_store
+    else
+        # r = sq >> 127: carry chain (2 * sq[4+j] + carry), starting from bit 127
+        loc_load.2 add.3 mem_load u32shr.31
+        # => [carry]
+
+        loc_load.2 add.4 mem_load mul.2 add u32split
+        loc_load.1 mem_store
+        loc_load.2 add.5 mem_load mul.2 add u32split
+        loc_load.1 add.1 mem_store
+        loc_load.2 add.6 mem_load mul.2 add u32split
+        loc_load.1 add.2 mem_store
+        loc_load.2 add.7 mem_load mul.2 add u32split
+        loc_load.1 add.3 mem_store
+        drop
+        # => []  (final carry is zero: bit 255 of sq is clear when f = 0)
+    end
+end

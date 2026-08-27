@@ -1,0 +1,279 @@
+use amm::math::muldiv
+use amm::math::sqrt_price_math
+use miden::core::math::u128
+
+# Faithful port of Uniswap v3 SwapMath.computeSwapStep.
+#
+# Port of contracts/amm-math/src/swap_math.rs (the verified Rust oracle). The Rust
+# function takes amount_remaining: i128 (>= 0 means exact input, < 0 exact output);
+# this module takes the sign-magnitude encoding [amount_abs: u128, exact_in: i1] with
+# exact_in == 1 iff amount_remaining >= 0 and amount_abs == |amount_remaining|.
+#
+# u128 values are 4 little-endian u32 limbs, limb 0 on top of the stack.
+
+# CONSTANTS
+# =================================================================================================
+
+# Fee denominator: fees are in hundredths of a bip (pips), e.g. 500, 3000, 10000.
+const FEE_PIPS_DENOMINATOR = 1000000
+
+# Sqrt price domain (Q64.96 in u128), same values as amm::math::tick_math
+const MIN_SQRT_L0 = 0x4EA15D28
+const MIN_SQRT_L1 = 0x00013B50
+const MIN_SQRT_L2 = 0x00000001
+const MIN_SQRT_L3 = 0x00000000
+const MAX_SQRT_L0 = 0xFB40724A
+const MAX_SQRT_L1 = 0xA81B33B5
+const MAX_SQRT_L2 = 0x35BB7F32
+const MAX_SQRT_L3 = 0xFFFEC4B1
+
+# compute_swap_step memory locals
+const SWAP_CUR_LOC = 0      # current sqrt price (0..3)
+const SWAP_TGT_LOC = 4      # target sqrt price (4..7)
+const SWAP_L_LOC = 8        # liquidity (8..11)
+const SWAP_AMT_LOC = 12     # |amount_remaining| (12..15)
+const SWAP_NEXT_LOC = 16    # sqrt_ratio_next (16..19)
+const SWAP_AIN_LOC = 20     # amount_in (20..23)
+const SWAP_AOUT_LOC = 24    # amount_out (24..27)
+const SWAP_FEE_LOC = 28     # fee_amount (28..31)
+const SWAP_EXACT_LOC = 32   # exact_in flag
+const SWAP_FEEPIPS_LOC = 33 # fee in pips
+const SWAP_ZFO_LOC = 34     # zero_for_one flag
+const SWAP_MAX_LOC = 35     # target-reached flag
+
+# ERRORS
+# =================================================================================================
+
+const ERR_SWAP_SQRT_PRICE_OUT_OF_RANGE = "swap_math: sqrt price out of supported range"
+const ERR_SWAP_FEE_PIPS_OUT_OF_RANGE = "swap_math: fee_pips out of range"
+
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Computes one step of a swap within a single price segment (Uniswap SwapMath
+#! computeSwapStep, exact-in and exact-out paths).
+#!
+#! Returns sqrt_ratio_next (never past the target), amount_in and fee_amount owed to
+#! the pool, and amount_out paid by the pool. All roundings favor the pool, mirroring
+#! Uniswap: amount_in rounds up, amount_out rounds down, fee_amount rounds up — except
+#! in the exact-input case where the target is not reached, where the entire unconsumed
+#! remainder becomes the fee. Exact-output never delivers more than requested.
+#!
+#! Inputs:  [c0, c1, c2, c3, t0, t1, t2, t3, l0, l1, l2, l3, r0, r1, r2, r3, exact_in, fee_pips]
+#! Outputs: [n0, n1, n2, n3, in0, in1, in2, in3, out0, out1, out2, out3, f0, f1, f2, f3]
+#!
+#! Where:
+#! - c0..c3 are the 32-bit limbs of the current sqrt price (c0 least significant).
+#! - t0..t3 are the 32-bit limbs of the target sqrt price (t0 least significant).
+#! - l0..l3 are the 32-bit limbs of the in-range liquidity (l0 least significant).
+#! - r0..r3 are the 32-bit limbs of |amount_remaining| (r0 least significant).
+#! - exact_in is 1 for exact input (amount_remaining >= 0), 0 for exact output.
+#! - fee_pips is the fee in hundredths of a bip, < 1000000.
+#! - n0..n3 are the 32-bit limbs of sqrt_ratio_next.
+#! - in0..in3 are the 32-bit limbs of amount_in (owed to the pool).
+#! - out0..out3 are the 32-bit limbs of amount_out (paid by the pool).
+#! - f0..f3 are the 32-bit limbs of fee_amount (owed to the pool).
+#!
+#! Panics if:
+#! - either price is outside the supported range.
+#! - fee_pips is not a u32 below 1000000.
+#! - any intermediate computation under/overflows (propagated from sqrt_price_math and
+#!   mul_div validation).
+#!
+#! Invocation: exec
+@locals(36)
+pub proc compute_swap_step(sqrt_current: u128, sqrt_target: u128, liquidity: u128, amount_abs: u128, exact_in: i1, fee_pips: u32) -> (fee: u128, amount_out: u128, amount_in: u128, sqrt_next: u128)
+    dupw exec.assert_swap_price_range
+    dupw.1 exec.assert_swap_price_range
+    loc_storew_le.SWAP_CUR_LOC dropw
+    loc_storew_le.SWAP_TGT_LOC dropw
+    loc_storew_le.SWAP_L_LOC dropw
+    loc_storew_le.SWAP_AMT_LOC dropw
+    loc_store.SWAP_EXACT_LOC
+    dup u32assert u32lt.FEE_PIPS_DENOMINATOR assert.err=ERR_SWAP_FEE_PIPS_OUT_OF_RANGE
+    loc_store.SWAP_FEEPIPS_LOC
+    # => []
+
+    # zero_for_one = current >= target
+    padw loc_loadw_le.SWAP_CUR_LOC padw loc_loadw_le.SWAP_TGT_LOC exec.u128::gte
+    loc_store.SWAP_ZFO_LOC
+
+    loc_load.SWAP_EXACT_LOC
+    if.true
+        # ---- exact input ----
+        # arl = mul_div_floor(amount, 1e6 - fee_pips, 1e6)
+        push.0 push.0 push.0 push.FEE_PIPS_DENOMINATOR
+        push.FEE_PIPS_DENOMINATOR loc_load.SWAP_FEEPIPS_LOC sub
+        push.0 push.0 push.0 movup.3
+        padw loc_loadw_le.SWAP_AMT_LOC
+        exec.muldiv::mul_div_floor
+        # => [ARL]
+
+        # amount_in for the full segment
+        loc_load.SWAP_ZFO_LOC
+        if.true
+            push.1
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            padw loc_loadw_le.SWAP_TGT_LOC
+            exec.sqrt_price_math::get_amount0_delta
+        else
+            push.1
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_TGT_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            exec.sqrt_price_math::get_amount1_delta
+        end
+        loc_storew_le.SWAP_AIN_LOC dropw
+        # => [ARL]
+
+        # next = target when arl covers the segment, else from_input(cur, L, arl, zfo)
+        dupw
+        padw loc_loadw_le.SWAP_AIN_LOC
+        exec.u128::gte
+        if.true
+            dropw
+            padw loc_loadw_le.SWAP_TGT_LOC loc_storew_le.SWAP_NEXT_LOC dropw
+        else
+            loc_load.SWAP_ZFO_LOC movdn.4
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            exec.sqrt_price_math::get_next_sqrt_price_from_input
+            loc_storew_le.SWAP_NEXT_LOC dropw
+        end
+    else
+        # ---- exact output ----
+        loc_load.SWAP_ZFO_LOC
+        if.true
+            push.0
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            padw loc_loadw_le.SWAP_TGT_LOC
+            exec.sqrt_price_math::get_amount1_delta
+        else
+            push.0
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_TGT_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            exec.sqrt_price_math::get_amount0_delta
+        end
+        loc_storew_le.SWAP_AOUT_LOC dropw
+        # => []
+
+        # next = target when the request covers the segment, else from_output
+        padw loc_loadw_le.SWAP_AMT_LOC padw loc_loadw_le.SWAP_AOUT_LOC
+        exec.u128::gte
+        if.true
+            padw loc_loadw_le.SWAP_TGT_LOC loc_storew_le.SWAP_NEXT_LOC dropw
+        else
+            loc_load.SWAP_ZFO_LOC
+            padw loc_loadw_le.SWAP_AMT_LOC
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            exec.sqrt_price_math::get_next_sqrt_price_from_output
+            loc_storew_le.SWAP_NEXT_LOC dropw
+        end
+    end
+    # => []
+
+    # max = (target == next)
+    padw loc_loadw_le.SWAP_TGT_LOC padw loc_loadw_le.SWAP_NEXT_LOC exec.u128::eq
+    loc_store.SWAP_MAX_LOC
+
+    # recompute the amounts against the actual endpoint (skipping the side already
+    # exact from the segment computation, mirroring the oracle)
+    loc_load.SWAP_ZFO_LOC
+    if.true
+        loc_load.SWAP_MAX_LOC loc_load.SWAP_EXACT_LOC and not
+        if.true
+            push.1
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            padw loc_loadw_le.SWAP_NEXT_LOC
+            exec.sqrt_price_math::get_amount0_delta
+            loc_storew_le.SWAP_AIN_LOC dropw
+        end
+        loc_load.SWAP_MAX_LOC loc_load.SWAP_EXACT_LOC not and not
+        if.true
+            push.0
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            padw loc_loadw_le.SWAP_NEXT_LOC
+            exec.sqrt_price_math::get_amount1_delta
+            loc_storew_le.SWAP_AOUT_LOC dropw
+        end
+    else
+        loc_load.SWAP_MAX_LOC loc_load.SWAP_EXACT_LOC and not
+        if.true
+            push.1
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_NEXT_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            exec.sqrt_price_math::get_amount1_delta
+            loc_storew_le.SWAP_AIN_LOC dropw
+        end
+        loc_load.SWAP_MAX_LOC loc_load.SWAP_EXACT_LOC not and not
+        if.true
+            push.0
+            padw loc_loadw_le.SWAP_L_LOC
+            padw loc_loadw_le.SWAP_NEXT_LOC
+            padw loc_loadw_le.SWAP_CUR_LOC
+            exec.sqrt_price_math::get_amount0_delta
+            loc_storew_le.SWAP_AOUT_LOC dropw
+        end
+    end
+
+    # exact output never delivers more than requested
+    loc_load.SWAP_EXACT_LOC not
+    if.true
+        padw loc_loadw_le.SWAP_AOUT_LOC padw loc_loadw_le.SWAP_AMT_LOC exec.u128::gt
+        if.true
+            padw loc_loadw_le.SWAP_AMT_LOC loc_storew_le.SWAP_AOUT_LOC dropw
+        end
+    end
+
+    # fee: exact-in short of the target takes the whole unconsumed remainder;
+    # otherwise fee = mul_div_ceil(amount_in, fee_pips, 1e6 - fee_pips)
+    loc_load.SWAP_EXACT_LOC
+    padw loc_loadw_le.SWAP_TGT_LOC padw loc_loadw_le.SWAP_NEXT_LOC exec.u128::eq not
+    and
+    if.true
+        padw loc_loadw_le.SWAP_AMT_LOC padw loc_loadw_le.SWAP_AIN_LOC exec.u128::wrapping_sub
+        loc_storew_le.SWAP_FEE_LOC dropw
+    else
+        push.0 push.0 push.0 push.FEE_PIPS_DENOMINATOR loc_load.SWAP_FEEPIPS_LOC sub
+        push.0 push.0 push.0 loc_load.SWAP_FEEPIPS_LOC
+        padw loc_loadw_le.SWAP_AIN_LOC
+        exec.muldiv::mul_div_ceil
+        loc_storew_le.SWAP_FEE_LOC dropw
+    end
+
+    padw loc_loadw_le.SWAP_FEE_LOC
+    padw loc_loadw_le.SWAP_AOUT_LOC
+    padw loc_loadw_le.SWAP_AIN_LOC
+    padw loc_loadw_le.SWAP_NEXT_LOC
+    # => [n0..n3, in0..in3, out0..out3, f0..f3]
+end
+
+# HELPER PROCEDURES
+# =================================================================================================
+
+#! Asserts that a sqrt price lies in [MIN_SQRT_RATIO, MAX_SQRT_RATIO] (inclusive).
+#!
+#! Inputs:  [p0, p1, p2, p3]
+#! Outputs: []
+#!
+#! Where:
+#! - p0..p3 are the 32-bit limbs of the sqrt price (p0 least significant).
+#!
+#! Panics if:
+#! - the price is outside the supported range.
+#!
+#! Invocation: exec
+proc assert_swap_price_range(sqrt_p: u128)
+    dupw
+    push.MIN_SQRT_L3 push.MIN_SQRT_L2 push.MIN_SQRT_L1 push.MIN_SQRT_L0
+    exec.u128::gte assert.err=ERR_SWAP_SQRT_PRICE_OUT_OF_RANGE
+    push.MAX_SQRT_L3 push.MAX_SQRT_L2 push.MAX_SQRT_L1 push.MAX_SQRT_L0
+    exec.u128::lte assert.err=ERR_SWAP_SQRT_PRICE_OUT_OF_RANGE
+end

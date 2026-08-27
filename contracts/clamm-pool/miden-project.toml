@@ -1,0 +1,16 @@
+[package]
+name = "clamm-pool"
+version = "0.1.0"
+
+[lib]
+kind = "account-component"
+# Full `miden:<package>/<interface>@<version>` id. The interface segment is the
+# kebab-cased component trait name (`ClammPool` -> `clamm-pool`).
+namespace = "miden:clamm-pool/clamm-pool@0.1.0"
+
+[dependencies]
+miden-core = "*"
+miden-protocol = "*"
+
+[package.metadata.miden]
+supported-types = ["RegularAccountImmutableCode"]

@@ -1,0 +1,60 @@
+use miden::protocol::account_id
+use miden::protocol::active_account
+use miden::protocol::active_note
+use clamm::pool
+
+# AMM burn note (MASM port of contracts/amm-note-burn). Carries no assets. Note
+# storage layout (8 felts, byte-identical to the Rust note):
+# [pool_id_suffix, pool_id_prefix, tick_lower_off, tick_upper_off,
+#  liq_l0, liq_l1, liq_l2, liq_l3].
+#
+# - Path A (executing account == pool_id): `call` the pool's kernel-read `burn`.
+# - Path B (executing account == sender): no-op cleanup — no assets, no deadline.
+# - Anyone else: panic.
+
+# CONSTANTS
+# =================================================================================================
+
+const STORAGE_PTR = 0
+const POOL_ID_SUFFIX_ITEM = 0
+const POOL_ID_PREFIX_ITEM = 1
+const NUM_STORAGE_ITEMS = 8
+
+# ERRORS
+# =================================================================================================
+
+const ERR_BURN_NOTE_BAD_STORAGE = "AMM burn note expects exactly 8 note storage items"
+const ERR_BURN_NOTE_UNAUTHORIZED = "AMM burn note: wrong pool or unauthorized consumer"
+
+# PROCEDURES
+# =================================================================================================
+
+#! AMM burn note script: dispatches to the pool's kernel-read `burn` procedure when
+#! consumed by the pool; the sender may consume the note as a no-op cleanup.
+#!
+#! Inputs:  []
+#! Outputs: []
+#!
+#! Panics if:
+#! - the note storage does not hold exactly 8 items.
+#! - the consumer is neither the targeted pool nor the note sender.
+@note_script
+pub proc main
+    push.STORAGE_PTR exec.active_note::get_storage
+    eq.NUM_STORAGE_ITEMS assert.err=ERR_BURN_NOTE_BAD_STORAGE
+
+    mem_load.POOL_ID_PREFIX_ITEM mem_load.POOL_ID_SUFFIX_ITEM
+    exec.active_account::get_id
+    exec.account_id::is_equal
+    if.true
+        # Path A: the pool executes; everything is kernel-read inside the pool
+        padw padw padw padw
+        call.pool::burn
+        dropw dropw dropw dropw
+    else
+        # Path B: sender cleanup no-op (no assets to move)
+        exec.active_note::get_sender
+        exec.active_account::get_id
+        exec.account_id::is_equal assert.err=ERR_BURN_NOTE_UNAUTHORIZED
+    end
+end

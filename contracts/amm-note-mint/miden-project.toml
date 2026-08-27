@@ -1,0 +1,20 @@
+[package]
+name = "amm-note-mint"
+version = "0.1.0"
+
+[lib]
+kind = "note"
+# Notes export a package-derived interface (miden-<package>), matching the #[note] macro.
+namespace = "miden:amm-note-mint/miden-amm-note-mint@0.1.0"
+
+[dependencies]
+miden-core = "*"
+miden-protocol = "*"
+clamm-pool = { path = "../clamm-pool" }
+basic-wallet = { path = "../basic-wallet" }
+
+# WIT for the account interfaces this note calls, produced by building the
+# clamm-pool and basic-wallet contracts first.
+[package.metadata.miden.dependencies]
+clamm-pool = { wit = "../clamm-pool/target/generated-wit/" }
+basic-wallet = { wit = "../basic-wallet/target/generated-wit/" }

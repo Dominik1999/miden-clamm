@@ -1,0 +1,1981 @@
+use amm::math::fee_growth
+use amm::math::sqrt_price_math
+use amm::math::swap_math
+use amm::math::tick_math
+use miden::core::crypto::hashes::poseidon2
+use miden::core::math::u64
+use miden::core::math::u128
+use miden::core::math::u256
+use miden::protocol::account_id
+use miden::protocol::active_account
+use miden::protocol::active_note
+use miden::protocol::asset
+use miden::protocol::native_account
+use miden::protocol::note
+use miden::protocol::output_note
+use miden::protocol::tx
+
+# Hand-written MASM port of the clamm-pool account component (DESIGN.md Part 2 storage
+# layout and note flows, Part 3 number formats), Stage 2 of the MASM port.
+#
+# Unlike the Rust-SDK build (whose compiler could not run the memory-writing
+# active-note reads from account context), every exported procedure here takes NO
+# arguments: note storage, note assets, the note sender, and the note serial number are
+# all read through the kernel (`active_note::*`) from inside the account code, so
+# nothing is trusted from the calling note script. Note storage layouts are
+# byte-identical to the Rust production notes, and a committed pool state produced by
+# this component is indistinguishable from the Rust component's for the same
+# operations (same slot names, same packings, same Poseidon2 position keys, same P2ID
+# serial scheme).
+#
+# Number formats (DESIGN Part 3):
+# - sqrtPriceX96: u128 as 4 little-endian u32 limbs in one Word.
+# - liquidity: u128, same packing; liquidityNet: i128 two's-complement bit pattern.
+# - fee growth accumulators: Q128.128 in u256 = two Words (lo/hi).
+# - ticks offset-encoded as tick + 2^19 so all stored ticks are natural numbers.
+
+# CONSTANTS
+# =================================================================================================
+
+# Storage slots. The slot names are identical to the Rust-SDK component's
+# (`clamm_pool::clamm_pool::<field>`) so the MockChain testbed reads both backends
+# through the same slot names.
+const POOL_CONFIG_SLOT = word("clamm_pool::clamm_pool::pool_config")
+const POOL_PARAMS_SLOT = word("clamm_pool::clamm_pool::pool_params")
+const P2ID_ROOT_SLOT = word("clamm_pool::clamm_pool::p2id_root")
+const SQRT_PRICE_SLOT = word("clamm_pool::clamm_pool::sqrt_price")
+const POOL_STATE_SLOT = word("clamm_pool::clamm_pool::pool_state")
+const LIQUIDITY_SLOT = word("clamm_pool::clamm_pool::liquidity")
+const FG0_LO_SLOT = word("clamm_pool::clamm_pool::fee_growth_global0_lo")
+const FG0_HI_SLOT = word("clamm_pool::clamm_pool::fee_growth_global0_hi")
+const FG1_LO_SLOT = word("clamm_pool::clamm_pool::fee_growth_global1_lo")
+const FG1_HI_SLOT = word("clamm_pool::clamm_pool::fee_growth_global1_hi")
+const TICKS_SLOT = word("clamm_pool::clamm_pool::ticks")
+const TICK_BITMAP_SLOT = word("clamm_pool::clamm_pool::tick_bitmap")
+const POSITIONS_SLOT = word("clamm_pool::clamm_pool::positions")
+
+# Tick encoding (DESIGN Part 2): stored tick = tick + 2^19.
+const TICK_OFFSET = 524288
+const MAX_TICK_OFF_ENCODED = 1048576    # 2 * TICK_OFFSET, upper bound of the encoding
+const OFF_MIN_TICK = 80652              # MIN_TICK (-443636) offset-encoded
+const OFF_MAX_TICK = 967924             # MAX_TICK (+443636) offset-encoded
+
+# Bias making compressed-tick -> tick conversion non-negative on felts:
+# biased_tick = c_off * spacing + (TICK_BIAS - TICK_OFFSET * spacing).
+const TICK_BIAS = 1152921504606846976        # 2^60
+const BIASED_MIN_TICK = 1152921504606403340  # TICK_BIAS + MIN_TICK
+const BIASED_MAX_TICK = 1152921504607290612  # TICK_BIAS + MAX_TICK
+const BIAS_MINUS_OFFSET = 1152921504606322688 # TICK_BIAS - TICK_OFFSET
+
+# Hard bound on swap-loop iterations (DESIGN divergence 8; same as the Rust build).
+const MAX_SWAP_ITERATIONS = 16
+
+# Domain tag mixed into the Poseidon2 position-key hash ("POS1").
+const POSITION_DOMAIN = 0x504F5331
+
+# Field ids of the striped position record (DESIGN Part 2).
+const POS_LIQUIDITY = 0
+const POS_FG0_LO = 1
+const POS_FG0_HI = 2
+const POS_FG1_LO = 3
+const POS_FG1_HI = 4
+const POS_TOKENS_OWED = 5
+
+# Field groups of the striped tick record (DESIGN Part 2).
+const TICK_LIQ_GROSS = 0
+const TICK_LIQ_NET = 1
+const TICK_FG0_LO = 2
+const TICK_FG0_HI = 3
+const TICK_FG1_LO = 4
+const TICK_FG1_HI = 5
+const TICK_NUM_GROUPS = 6
+
+# Serial-derivation salts for P2ID output notes (same scheme as the Rust pool).
+const SALT_SWAP_OUT = 0
+const SALT_SWAP_REFUND = 1
+const SALT_MINT_REFUND = 2
+const SALT_COLLECT = 3
+
+# P2ID output note parameters (tag 0, public storage mode).
+const P2ID_NOTE_TAG = 0
+const NOTE_TYPE_PUBLIC = 1
+
+# Sqrt price domain (Q64.96 in u128), same values as amm::math::tick_math.
+const MIN_SQRT_L0 = 0x4EA15D28
+const MIN_SQRT_L1 = 0x00013B50
+const MIN_SQRT_L2 = 0x00000001
+const MIN_SQRT_L3 = 0x00000000
+const MAX_SQRT_L0 = 0xFB40724A
+const MAX_SQRT_L1 = 0xA81B33B5
+const MAX_SQRT_L2 = 0x35BB7F32
+const MAX_SQRT_L3 = 0xFFFEC4B1
+
+# Goldilocks modulus limbs, for u64 -> felt range assertions.
+const FELT_MOD_LO = 1
+const FELT_MOD_HI = 0xFFFFFFFF
+const MAX_U32 = 0x100000000
+
+# Shared note storage item indices (all four note layouts start with the pool id).
+const ST_POOL_ID_SUFFIX = 0
+const ST_POOL_ID_PREFIX = 1
+
+# Swap note storage items (8 felts, byte-identical to the Rust production note).
+const SWAP_ST_DIRECTION = 2
+const SWAP_ST_MIN_OUT_LO = 3
+const SWAP_ST_MIN_OUT_HI = 4
+const SWAP_ST_RECIPIENT_SUFFIX = 5
+const SWAP_ST_RECIPIENT_PREFIX = 6
+const SWAP_ST_DEADLINE = 7
+
+# Mint note storage items (9 felts).
+const MINT_ST_TICK_LOWER = 2
+const MINT_ST_TICK_UPPER = 3
+const MINT_ST_LIQ_L0 = 4
+const MINT_ST_LIQ_L1 = 5
+const MINT_ST_LIQ_L2 = 6
+const MINT_ST_LIQ_L3 = 7
+const MINT_ST_DEADLINE = 8
+
+# Burn note storage items (8 felts).
+const BURN_ST_TICK_LOWER = 2
+const BURN_ST_TICK_UPPER = 3
+const BURN_ST_LIQ_L0 = 4
+const BURN_ST_LIQ_L1 = 5
+const BURN_ST_LIQ_L2 = 6
+const BURN_ST_LIQ_L3 = 7
+
+# Collect note storage items (4 felts).
+const COLLECT_ST_TICK_LOWER = 2
+const COLLECT_ST_TICK_UPPER = 3
+
+# swap memory locals
+const SW_STORAGE = 0        # 8 note storage felts (0..7)
+const SW_ASSET_KEY = 8      # input asset KEY (8..11)
+const SW_ASSET_VALUE = 12   # input asset VALUE (12..15)
+const SW_ASSET_AMOUNT = 12  # fungible amount = VALUE limb 0
+const SW_SCRATCH_KEY = 16   # expected/output asset KEY (16..19)
+const SW_SCRATCH_VALUE = 20 # expected/output asset VALUE (20..23)
+const SW_SQRT = 24          # current sqrt price (24..27)
+const SW_LIQ = 28           # active liquidity (28..31)
+const SW_REMAINING = 32     # unconsumed input (32..35)
+const SW_OUT_TOTAL = 36     # accumulated output (36..39)
+const SW_FG_IN_LO = 40      # in-direction fee growth accumulator, low word (40..43)
+const SW_FG_IN_HI = 44      # high word (44..47)
+const SW_MIN_OUT = 48       # minimum acceptable output (48..51)
+const SW_LIMIT = 52         # price limit for the swap direction (52..55)
+const SW_TARGET = 56        # per-step target price (56..59)
+const SW_NEXT = 60          # per-step end price (60..63)
+const SW_STEP_IN = 64       # per-step amount in (64..67)
+const SW_STEP_OUT = 68      # per-step amount out (68..71)
+const SW_STEP_FEE = 72      # per-step fee (72..75)
+const SW_CONSUMED = 76      # per-step in + fee (76..79)
+const SW_ZFO = 80           # zero_for_one flag
+const SW_FEE_PIPS = 81
+const SW_SPACING = 82
+const SW_TICK = 83          # current tick (offset-encoded)
+const SW_ITER = 84          # loop iteration counter
+const SW_NEEDS_REV = 85     # reverse-tick-mapping flag
+const SW_NEXT_TICK = 86     # per-step next initialized tick
+const SW_NEXT_INIT = 87     # per-step initialized flag
+const SW_REACHED = 88       # per-step target-reached flag
+
+# mint memory locals
+const MI_STORAGE = 0        # 9 note storage felts (0..8)
+const MI_ASSET0_KEY = 12    # first note asset (12..19)
+const MI_ASSET0_VALUE = 16
+const MI_ASSET1_KEY = 20    # second note asset (20..27)
+const MI_ASSET1_VALUE = 24
+const MI_LIQ = 28           # liquidity desired (28..31)
+const MI_SQRT = 32          # current sqrt price (32..35)
+const MI_REFUND = 36        # refund assets (36..51)
+const MI_REFUND0_KEY = 36
+const MI_REFUND0_VALUE = 40
+const MI_NUM_ASSETS = 52
+const MI_PROVIDED0 = 53
+const MI_PROVIDED1 = 54
+const MI_SPACING = 55
+const MI_TICK_CUR = 56
+const MI_SENDER_SUFFIX = 57
+const MI_SENDER_PREFIX = 58
+const MI_REFUND_COUNT = 59
+const MI_OWED0 = 60
+const MI_OWED1 = 61
+const MI_SCRATCH = 62
+
+# burn memory locals
+const BU_STORAGE = 0        # 8 note storage felts (0..7)
+const BU_LIQ = 8            # liquidity to burn (8..11)
+const BU_NEG_LIQ = 12       # negated delta (12..15)
+const BU_SQRT = 16          # current sqrt price (16..19)
+const BU_TICK_CUR = 20
+const BU_SENDER_SUFFIX = 21
+const BU_SENDER_PREFIX = 22
+const BU_SPACING = 23
+const BU_AMOUNT0 = 24
+const BU_AMOUNT1 = 25
+
+# collect memory locals
+const CO_STORAGE = 0        # 4 note storage felts (0..3)
+const CO_SENDER_SUFFIX = 4
+const CO_SENDER_PREFIX = 5
+const CO_H0 = 6
+const CO_H1 = 7
+const CO_H2 = 8
+const CO_OWED0 = 9
+const CO_OWED1 = 10
+const CO_COUNT = 11
+const CO_ASSETS = 12        # payout assets (12..27)
+const CO_ASSET0_KEY = 12
+const CO_ASSET0_VALUE = 16
+const CO_SCRATCH = 28
+
+# tick_update memory locals
+const TU_TICK = 0
+const TU_TICK_CUR = 1
+const TU_UPPER = 2
+const TU_DELTA_PTR = 3
+const TU_GROSS_BEFORE = 4   # (4..7)
+const TU_GROSS_AFTER = 8    # (8..11)
+const TU_FLIPPED = 12
+
+# update_position memory locals
+const UP_OWNER_SUFFIX = 0
+const UP_OWNER_PREFIX = 1
+const UP_LOWER = 2
+const UP_UPPER = 3
+const UP_TICK_CUR = 4
+const UP_DELTA_PTR = 5
+const UP_SPACING = 6
+const UP_FLIPPED_LOWER = 7
+const UP_FLIPPED_UPPER = 8
+const UP_H0 = 9
+const UP_H1 = 10
+const UP_H2 = 11
+const UP_INSIDE0_LO = 12    # fee growth inside, token0 (12..19)
+const UP_INSIDE0_HI = 16
+const UP_INSIDE1_LO = 20    # fee growth inside, token1 (20..27)
+const UP_INSIDE1_HI = 24
+const UP_POS_LIQ = 28       # position liquidity before (28..31)
+const UP_FEES0 = 32         # fees owed token0 (32..35)
+const UP_FEES1 = 36         # fees owed token1 (36..39)
+
+# fee_growth_inside memory locals
+const FI_LOWER = 0
+const FI_UPPER = 1
+const FI_TICK_CUR = 2
+const FI_OUT_PTR = 3
+
+# cross_tick memory locals
+const CT_TICK = 0
+const CT_ZFO = 1
+const CT_FG_IN_PTR = 2
+
+# next_init_tick memory locals
+const NIT_LTE = 0
+const NIT_SPACING = 1
+const NIT_WORD_INDEX = 2
+const NIT_BIT = 3
+
+# emit_p2id memory locals
+const EM_SERIAL = 0         # 5-felt Poseidon2 preimage (0..4; 5..7 readable scratch)
+const EM_SALT = 4
+const EM_P2ID_STORAGE = 8   # P2ID note storage [recipient_suffix, recipient_prefix] (8..9)
+const EM_P2ID_STORAGE_PREFIX = 9
+const EM_NUM_ASSETS = 11
+const EM_ASSETS_PTR = 12
+const EM_SALT_IN = 13
+const EM_NOTE_IDX = 14
+
+# classify_note_asset memory locals
+const CA_PTR = 0
+const CA_AMOUNT = 1
+
+# position_base memory locals: 5-felt preimage at 0..4 (5..7 readable scratch)
+
+# ERRORS
+# =================================================================================================
+
+const ERR_POOL_NOT_INITIALIZED = "clamm: pool not initialized"
+const ERR_NOTE_WRONG_POOL = "clamm: active note does not target this pool"
+const ERR_STORED_TICK_OUT_OF_RANGE = "clamm: stored tick out of range"
+const ERR_TICK_OUT_OF_RANGE = "clamm: tick out of supported range"
+const ERR_TICK_ORDER = "clamm: tick_lower must be below tick_upper"
+const ERR_TICK_NOT_ALIGNED = "clamm: tick not aligned to tick spacing"
+const ERR_LIQUIDITY_UNDERFLOW = "clamm: liquidity delta underflow"
+const ERR_LIQUIDITY_OVERFLOW = "clamm: liquidity delta overflow"
+const ERR_LIQUIDITY_NET_OVERFLOW = "clamm: liquidityNet overflow"
+const ERR_LIQUIDITY_EXCEEDS_I128 = "clamm: liquidity delta exceeds i128"
+const ERR_AMOUNT_EXCEEDS_U64 = "clamm: amount exceeds u64 range"
+const ERR_TOKENS_OWED_OVERFLOW = "clamm: tokensOwed overflow"
+const ERR_SWAP_BAD_STORAGE = "clamm: swap note expects exactly 8 storage items"
+const ERR_SWAP_BAD_DIRECTION = "clamm: invalid swap direction"
+const ERR_SWAP_BAD_ASSET_COUNT = "clamm: swap note must carry exactly one asset"
+const ERR_SWAP_ZERO_INPUT = "clamm: zero swap input"
+const ERR_SWAP_WRONG_ASSET = "clamm: asset faucet does not match pool/direction"
+const ERR_SWAP_TOO_MANY_CROSSINGS = "clamm: swap exceeds max tick crossings"
+const ERR_SWAP_STEP_OVERFLOW = "clamm: swap step amount overflow"
+const ERR_SWAP_STEP_EXCEEDS_REMAINING = "clamm: swap step consumed more than remaining"
+const ERR_SWAP_OUTPUT_OVERFLOW = "clamm: swap output overflow"
+const ERR_SWAP_INSUFFICIENT_LIQUIDITY = "clamm: insufficient liquidity in range to consume swap input"
+const ERR_SWAP_SLIPPAGE = "clamm: slippage - amount out below minimum"
+const ERR_SWAP_ZERO_OUTPUT = "clamm: zero swap output"
+const ERR_MINT_BAD_STORAGE = "clamm: mint note expects exactly 9 storage items"
+const ERR_MINT_NO_ASSETS = "clamm: mint note carries no assets"
+const ERR_MINT_TOO_MANY_ASSETS = "clamm: mint note carries more than two assets"
+const ERR_MINT_ZERO_ASSET = "clamm: mint note asset has zero amount"
+const ERR_MINT_FOREIGN_ASSET = "clamm: asset faucet does not match pool config"
+const ERR_MINT_ASSET_VALUE_MISMATCH = "clamm: note asset value word is not canonical"
+const ERR_MINT_ZERO_LIQUIDITY = "clamm: zero liquidity mint"
+const ERR_MINT_INSUFFICIENT_ASSETS = "clamm: mint note assets do not cover amounts owed"
+const ERR_BURN_BAD_STORAGE = "clamm: burn note expects exactly 8 storage items"
+const ERR_BURN_ZERO_LIQUIDITY = "clamm: zero liquidity burn"
+const ERR_COLLECT_BAD_STORAGE = "clamm: collect note expects exactly 4 storage items"
+const ERR_COLLECT_NOTHING = "clamm: nothing to collect"
+
+# PUBLIC INTERFACE
+# =================================================================================================
+
+#! Executes an exact-input swap driven entirely by kernel-read note state.
+#!
+#! Reads the swap parameters from the active note's storage
+#! `[pool_id_suffix, pool_id_prefix, direction, min_out_lo, min_out_hi,
+#! recipient_suffix, recipient_prefix, deadline_height]`, the input asset from the
+#! active note's assets, and the sender from the note metadata. Check order (DESIGN
+#! Part 2): asset validation against the immutable pool config, then the deadline,
+#! then the swap loop. At/after the deadline the input is refunded to the sender via
+#! P2ID and no swap math runs. On success the output tokens leave on a P2ID note to
+#! the recipient.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Panics if:
+#! - the note storage or assets do not match the swap-note layout.
+#! - the note does not target this pool or the pool is uninitialized.
+#! - the input asset is not the pool token for the requested direction.
+#! - the swap exceeds the tick-crossing bound or the in-range liquidity.
+#! - the output is below the requested minimum (pre-deadline slippage).
+#!
+#! Invocation: call
+@locals(92)
+pub proc swap
+    # ---- note storage (8 items) ----
+    locaddr.SW_STORAGE exec.active_note::get_storage
+    eq.8 assert.err=ERR_SWAP_BAD_STORAGE
+    # => [pad(16)]
+
+    # ---- defense in depth: the note must target this pool ----
+    loc_load.ST_POOL_ID_PREFIX loc_load.ST_POOL_ID_SUFFIX
+    exec.active_account::get_id
+    exec.account_id::is_equal assert.err=ERR_NOTE_WRONG_POOL
+
+    # ---- pool must be initialized; load the current tick ----
+    exec.require_ready
+    loc_store.SW_TICK
+
+    # ---- direction ----
+    loc_load.SWAP_ST_DIRECTION
+    dup lte.1 assert.err=ERR_SWAP_BAD_DIRECTION
+    eq.0 loc_store.SW_ZFO
+
+    # ---- min_out as u128 [lo, hi, 0, 0] ----
+    loc_load.SWAP_ST_MIN_OUT_HI loc_load.SWAP_ST_MIN_OUT_LO u32assert2
+    push.0 movdn.2 push.0 movdn.3
+    loc_storew_le.SW_MIN_OUT dropw
+
+    # ---- input asset: exactly one, and it must be the expected pool token ----
+    locaddr.SW_ASSET_KEY exec.active_note::get_assets
+    eq.1 assert.err=ERR_SWAP_BAD_ASSET_COUNT
+    loc_load.SW_ASSET_AMOUNT
+    dup neq.0 assert.err=ERR_SWAP_ZERO_INPUT
+    # => [amount]
+
+    # in-token index: 0 when zero_for_one, 1 otherwise
+    loc_load.SW_ZFO
+    if.true push.0 else push.1 end
+    # => [token_index, amount]
+
+    exec.make_pool_asset
+    # => [ASSET_KEY, ASSET_VALUE]
+
+    loc_storew_le.SW_SCRATCH_KEY dropw
+    loc_storew_le.SW_SCRATCH_VALUE dropw
+    padw loc_loadw_le.SW_ASSET_KEY padw loc_loadw_le.SW_SCRATCH_KEY
+    assert_eqw.err=ERR_SWAP_WRONG_ASSET
+    padw loc_loadw_le.SW_ASSET_VALUE padw loc_loadw_le.SW_SCRATCH_VALUE
+    assert_eqw.err=ERR_SWAP_WRONG_ASSET
+
+    # ---- deadline: at/after -> consume-and-refund, no swap math ----
+    loc_load.SWAP_ST_DEADLINE
+    exec.tx::get_block_number
+    lte
+    # => [deadline <= block]
+    if.true
+        # move the input into the vault, then refund it to the sender via P2ID
+        padw loc_loadw_le.SW_ASSET_VALUE padw loc_loadw_le.SW_ASSET_KEY
+        exec.native_account::add_asset dropw
+        push.1 locaddr.SW_ASSET_KEY push.SALT_SWAP_REFUND
+        exec.active_note::get_sender
+        # => [sender_suffix, sender_prefix, salt, assets_ptr, num_assets]
+        exec.emit_p2id
+    else
+        # ---- pool parameters and state ----
+        push.POOL_PARAMS_SLOT[0..2] exec.active_account::get_item
+        # => [fee_pips, spacing, 0, 0]
+        u32assert loc_store.SW_FEE_PIPS
+        u32assert loc_store.SW_SPACING
+        drop drop
+        push.SQRT_PRICE_SLOT[0..2] exec.active_account::get_item
+        loc_storew_le.SW_SQRT dropw
+        push.LIQUIDITY_SLOT[0..2] exec.active_account::get_item
+        loc_storew_le.SW_LIQ dropw
+        loc_load.SW_ZFO
+        if.true exec.read_fg0 else exec.read_fg1 end
+        loc_storew_le.SW_FG_IN_LO dropw
+        loc_storew_le.SW_FG_IN_HI dropw
+        loc_load.SW_ZFO
+        if.true
+            push.MIN_SQRT_L3 push.MIN_SQRT_L2 push.MIN_SQRT_L1 push.MIN_SQRT_L0
+        else
+            push.MAX_SQRT_L3 push.MAX_SQRT_L2 push.MAX_SQRT_L1 push.MAX_SQRT_L0
+        end
+        loc_storew_le.SW_LIMIT dropw
+        loc_load.SW_ASSET_AMOUNT u32split
+        push.0 movdn.2 push.0 movdn.3
+        loc_storew_le.SW_REMAINING dropw
+        padw loc_storew_le.SW_OUT_TOTAL dropw
+        push.0 loc_store.SW_ITER
+        push.0 loc_store.SW_NEEDS_REV
+
+        # ---- Uniswap v3 exact-input swap loop ----
+        padw loc_loadw_le.SW_REMAINING exec.u128::eqz not
+        padw loc_loadw_le.SW_LIMIT padw loc_loadw_le.SW_SQRT exec.u128::eq not
+        and
+        while.true
+            loc_load.SW_ITER add.1 dup loc_store.SW_ITER
+            lte.MAX_SWAP_ITERATIONS assert.err=ERR_SWAP_TOO_MANY_CROSSINGS
+
+            # next initialized tick within one 128-bit bitmap word
+            loc_load.SW_ZFO loc_load.SW_SPACING loc_load.SW_TICK
+            exec.next_init_tick
+            # => [next_tick_off, initialized]
+            loc_store.SW_NEXT_TICK
+            loc_store.SW_NEXT_INIT
+
+            loc_load.SW_NEXT_TICK exec.tick_math::get_sqrt_ratio_at_tick
+            loc_storew_le.SW_TARGET dropw
+
+            loc_load.SW_FEE_PIPS push.1
+            padw loc_loadw_le.SW_REMAINING
+            padw loc_loadw_le.SW_LIQ
+            padw loc_loadw_le.SW_TARGET
+            padw loc_loadw_le.SW_SQRT
+            exec.swap_math::compute_swap_step
+            # => [NEXT, STEP_IN, STEP_OUT, STEP_FEE]
+            loc_storew_le.SW_NEXT dropw
+            loc_storew_le.SW_STEP_IN dropw
+            loc_storew_le.SW_STEP_OUT dropw
+            loc_storew_le.SW_STEP_FEE dropw
+
+            # remaining -= step_in + step_fee (checked)
+            padw loc_loadw_le.SW_STEP_IN
+            padw loc_loadw_le.SW_STEP_FEE
+            exec.u128::overflowing_add assertz.err=ERR_SWAP_STEP_OVERFLOW
+            loc_storew_le.SW_CONSUMED dropw
+            padw loc_loadw_le.SW_REMAINING padw loc_loadw_le.SW_CONSUMED
+            exec.u128::gte assert.err=ERR_SWAP_STEP_EXCEEDS_REMAINING
+            padw loc_loadw_le.SW_REMAINING padw loc_loadw_le.SW_CONSUMED
+            exec.u128::wrapping_sub
+            loc_storew_le.SW_REMAINING dropw
+
+            # out_total += step_out (checked)
+            padw loc_loadw_le.SW_OUT_TOTAL
+            padw loc_loadw_le.SW_STEP_OUT
+            exec.u128::overflowing_add assertz.err=ERR_SWAP_OUTPUT_OVERFLOW
+            loc_storew_le.SW_OUT_TOTAL dropw
+
+            # fee growth accrual when liquidity and fee are both non-zero
+            padw loc_loadw_le.SW_LIQ exec.u128::eqz not
+            padw loc_loadw_le.SW_STEP_FEE exec.u128::eqz not
+            and
+            if.true
+                padw loc_loadw_le.SW_LIQ
+                padw loc_loadw_le.SW_STEP_FEE
+                exec.fee_growth::fee_shl128_div_liquidity
+                # => [INCREMENT (8 limbs)]
+                padw loc_loadw_le.SW_FG_IN_HI padw loc_loadw_le.SW_FG_IN_LO
+                exec.fee_growth::u256_wrapping_add
+                loc_storew_le.SW_FG_IN_LO dropw
+                loc_storew_le.SW_FG_IN_HI dropw
+            end
+
+            # reached = (next == target); cross when reached and initialized
+            padw loc_loadw_le.SW_TARGET padw loc_loadw_le.SW_NEXT
+            exec.u128::eq
+            dup loc_store.SW_REACHED
+            loc_load.SW_NEXT_INIT and
+            if.true
+                locaddr.SW_FG_IN_LO loc_load.SW_ZFO loc_load.SW_NEXT_TICK
+                exec.cross_tick
+                # => [NET]
+                loc_load.SW_ZFO
+                if.true exec.u128_neg end
+                # => [DELTA]
+                padw loc_loadw_le.SW_LIQ swapw
+                # => [DELTA, LIQ]
+                exec.liq_add_delta
+                loc_storew_le.SW_LIQ dropw
+            end
+
+            # tick advance on a reached target
+            loc_load.SW_REACHED
+            if.true
+                loc_load.SW_ZFO
+                if.true
+                    loc_load.SW_NEXT_TICK sub.1
+                else
+                    loc_load.SW_NEXT_TICK
+                end
+                loc_store.SW_TICK
+            end
+
+            # needs_reverse_map = !reached and next != current (last iteration wins)
+            padw loc_loadw_le.SW_SQRT padw loc_loadw_le.SW_NEXT
+            exec.u128::neq
+            loc_load.SW_REACHED not and
+            loc_store.SW_NEEDS_REV
+
+            padw loc_loadw_le.SW_NEXT loc_storew_le.SW_SQRT dropw
+
+            padw loc_loadw_le.SW_REMAINING exec.u128::eqz not
+            padw loc_loadw_le.SW_LIMIT padw loc_loadw_le.SW_SQRT exec.u128::eq not
+            and
+        end
+
+        padw loc_loadw_le.SW_REMAINING exec.u128::eqz
+        assert.err=ERR_SWAP_INSUFFICIENT_LIQUIDITY
+
+        # reverse tick mapping when the swap ends strictly inside a tick range
+        loc_load.SW_NEEDS_REV
+        if.true
+            padw loc_loadw_le.SW_SQRT
+            exec.tick_math::get_tick_at_sqrt_ratio
+            loc_store.SW_TICK
+        end
+
+        # slippage and non-zero output
+        padw loc_loadw_le.SW_OUT_TOTAL padw loc_loadw_le.SW_MIN_OUT
+        exec.u128::gte assert.err=ERR_SWAP_SLIPPAGE
+        padw loc_loadw_le.SW_OUT_TOTAL exec.u128::eqz
+        assertz.err=ERR_SWAP_ZERO_OUTPUT
+
+        # ---- commit pool state ----
+        padw loc_loadw_le.SW_SQRT
+        push.SQRT_PRICE_SLOT[0..2] exec.native_account::set_item dropw
+        push.0 push.0 push.1 loc_load.SW_TICK
+        push.POOL_STATE_SLOT[0..2] exec.native_account::set_item dropw
+        padw loc_loadw_le.SW_LIQ
+        push.LIQUIDITY_SLOT[0..2] exec.native_account::set_item dropw
+        padw loc_loadw_le.SW_FG_IN_HI padw loc_loadw_le.SW_FG_IN_LO
+        loc_load.SW_ZFO
+        if.true exec.write_fg0 else exec.write_fg1 end
+
+        # ---- assets: input into the vault, output onto a P2ID note ----
+        padw loc_loadw_le.SW_ASSET_VALUE padw loc_loadw_le.SW_ASSET_KEY
+        exec.native_account::add_asset dropw
+        padw loc_loadw_le.SW_OUT_TOTAL exec.u128_to_amount_felt
+        loc_load.SW_ZFO
+        if.true push.1 else push.0 end
+        # => [out_token_index, amount_out]
+        exec.make_pool_asset
+        loc_storew_le.SW_SCRATCH_KEY dropw
+        loc_storew_le.SW_SCRATCH_VALUE dropw
+        push.1 locaddr.SW_SCRATCH_KEY push.SALT_SWAP_OUT
+        loc_load.SWAP_ST_RECIPIENT_PREFIX loc_load.SWAP_ST_RECIPIENT_SUFFIX
+        exec.emit_p2id
+    end
+end
+
+#! Adds liquidity for the note sender (Uniswap mint), driven entirely by kernel-read
+#! note state.
+#!
+#! Reads `[pool_id_suffix, pool_id_prefix, tick_lower_off, tick_upper_off,
+#! liq_l0..liq_l3, deadline_height]` from the active note's storage and one or two
+#! pool-token assets from the note. Amounts owed at the current price are computed
+#! rounding up; the position is recorded under the kernel-read sender; excess assets
+#! are refunded via P2ID. At/after the deadline all assets are refunded and no state
+#! changes.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Panics if:
+#! - the note storage or assets do not match the mint-note layout.
+#! - the note does not target this pool or the pool is uninitialized.
+#! - an asset does not match the pool's token faucets.
+#! - the tick range is invalid or misaligned, or the liquidity is zero / > i128::MAX.
+#! - the provided assets do not cover the amounts owed.
+#!
+#! Invocation: call
+@locals(64)
+pub proc mint
+    # ---- note storage (9 items) ----
+    locaddr.MI_STORAGE exec.active_note::get_storage
+    eq.9 assert.err=ERR_MINT_BAD_STORAGE
+
+    loc_load.ST_POOL_ID_PREFIX loc_load.ST_POOL_ID_SUFFIX
+    exec.active_account::get_id
+    exec.account_id::is_equal assert.err=ERR_NOTE_WRONG_POOL
+
+    exec.require_ready
+    loc_store.MI_TICK_CUR
+
+    # ---- assets: one or two pool tokens ----
+    locaddr.MI_ASSET0_KEY exec.active_note::get_assets
+    dup loc_store.MI_NUM_ASSETS
+    dup neq.0 assert.err=ERR_MINT_NO_ASSETS
+    lte.2 assert.err=ERR_MINT_TOO_MANY_ASSETS
+    push.0 loc_store.MI_PROVIDED0
+    push.0 loc_store.MI_PROVIDED1
+    locaddr.MI_ASSET0_KEY exec.classify_note_asset
+    # => [token_index, amount]
+    if.true loc_store.MI_PROVIDED1 else loc_store.MI_PROVIDED0 end
+    loc_load.MI_NUM_ASSETS eq.2
+    if.true
+        locaddr.MI_ASSET1_KEY exec.classify_note_asset
+        if.true
+            loc_load.MI_PROVIDED1 exec.u64f_checked_add loc_store.MI_PROVIDED1
+        else
+            loc_load.MI_PROVIDED0 exec.u64f_checked_add loc_store.MI_PROVIDED0
+        end
+    end
+
+    exec.active_note::get_sender
+    loc_store.MI_SENDER_SUFFIX loc_store.MI_SENDER_PREFIX
+
+    # ---- deadline: at/after -> consume-and-refund everything ----
+    loc_load.MINT_ST_DEADLINE
+    exec.tx::get_block_number
+    lte
+    if.true
+        padw loc_loadw_le.MI_ASSET0_VALUE padw loc_loadw_le.MI_ASSET0_KEY
+        exec.native_account::add_asset dropw
+        loc_load.MI_NUM_ASSETS eq.2
+        if.true
+            padw loc_loadw_le.MI_ASSET1_VALUE padw loc_loadw_le.MI_ASSET1_KEY
+            exec.native_account::add_asset dropw
+        end
+        loc_load.MI_NUM_ASSETS locaddr.MI_ASSET0_KEY push.SALT_MINT_REFUND
+        loc_load.MI_SENDER_PREFIX loc_load.MI_SENDER_SUFFIX
+        exec.emit_p2id
+    else
+        # ---- range checks ----
+        push.POOL_PARAMS_SLOT[0..2] exec.active_account::get_item
+        drop u32assert loc_store.MI_SPACING drop drop
+        loc_load.MI_SPACING
+        loc_load.MINT_ST_TICK_UPPER loc_load.MINT_ST_TICK_LOWER
+        exec.validate_tick_range
+
+        # ---- liquidity desired (4 u32 limbs, <= i128::MAX, non-zero) ----
+        loc_load.MINT_ST_LIQ_L3 u32assert
+        dup u32lt.0x80000000 assert.err=ERR_LIQUIDITY_EXCEEDS_I128
+        loc_load.MINT_ST_LIQ_L2 u32assert
+        loc_load.MINT_ST_LIQ_L1 u32assert
+        loc_load.MINT_ST_LIQ_L0 u32assert
+        loc_storew_le.MI_LIQ dropw
+        padw loc_loadw_le.MI_LIQ exec.u128::eqz assertz.err=ERR_MINT_ZERO_LIQUIDITY
+
+        # ---- amounts owed at the current price, rounded up (pool-favoring) ----
+        push.SQRT_PRICE_SLOT[0..2] exec.active_account::get_item
+        loc_storew_le.MI_SQRT dropw
+        locaddr.MI_SQRT locaddr.MI_LIQ push.1 loc_load.MI_TICK_CUR
+        loc_load.MINT_ST_TICK_UPPER loc_load.MINT_ST_TICK_LOWER
+        exec.amounts_for_liquidity
+        # => [AMOUNT0, AMOUNT1]
+        exec.u128_to_amount_felt loc_store.MI_OWED0
+        exec.u128_to_amount_felt loc_store.MI_OWED1
+        loc_load.MI_PROVIDED0 loc_load.MI_OWED0 gte
+        assert.err=ERR_MINT_INSUFFICIENT_ASSETS
+        loc_load.MI_PROVIDED1 loc_load.MI_OWED1 gte
+        assert.err=ERR_MINT_INSUFFICIENT_ASSETS
+
+        # ---- position + tick + bitmap updates (owner = kernel-read sender) ----
+        locaddr.MI_LIQ loc_load.MI_TICK_CUR
+        loc_load.MINT_ST_TICK_UPPER loc_load.MINT_ST_TICK_LOWER
+        loc_load.MI_SENDER_PREFIX loc_load.MI_SENDER_SUFFIX
+        exec.update_position
+
+        # ---- active liquidity when the range is in scope ----
+        loc_load.MINT_ST_TICK_LOWER loc_load.MI_TICK_CUR lte
+        loc_load.MI_TICK_CUR loc_load.MINT_ST_TICK_UPPER lt
+        and
+        if.true
+            push.LIQUIDITY_SLOT[0..2] exec.active_account::get_item
+            padw loc_loadw_le.MI_LIQ
+            exec.liq_add_delta
+            push.LIQUIDITY_SLOT[0..2] exec.native_account::set_item dropw
+        end
+
+        # ---- move all provided assets into the vault ----
+        padw loc_loadw_le.MI_ASSET0_VALUE padw loc_loadw_le.MI_ASSET0_KEY
+        exec.native_account::add_asset dropw
+        loc_load.MI_NUM_ASSETS eq.2
+        if.true
+            padw loc_loadw_le.MI_ASSET1_VALUE padw loc_loadw_le.MI_ASSET1_KEY
+            exec.native_account::add_asset dropw
+        end
+
+        # ---- refund the excess via P2ID ----
+        push.0 loc_store.MI_REFUND_COUNT
+        loc_load.MI_PROVIDED0 loc_load.MI_OWED0 sub
+        dup neq.0
+        if.true
+            push.0 exec.make_pool_asset
+            loc_storew_le.MI_REFUND0_KEY dropw
+            loc_storew_le.MI_REFUND0_VALUE dropw
+            push.1 loc_store.MI_REFUND_COUNT
+        else
+            drop
+        end
+        loc_load.MI_PROVIDED1 loc_load.MI_OWED1 sub
+        dup neq.0
+        if.true
+            loc_load.MI_REFUND_COUNT mul.8 locaddr.MI_REFUND add loc_store.MI_SCRATCH
+            push.1 exec.make_pool_asset
+            loc_load.MI_SCRATCH mem_storew_le dropw
+            loc_load.MI_SCRATCH add.4 mem_storew_le dropw
+            loc_load.MI_REFUND_COUNT add.1 loc_store.MI_REFUND_COUNT
+        else
+            drop
+        end
+        loc_load.MI_REFUND_COUNT neq.0
+        if.true
+            loc_load.MI_REFUND_COUNT locaddr.MI_REFUND push.SALT_MINT_REFUND
+            loc_load.MI_SENDER_PREFIX loc_load.MI_SENDER_SUFFIX
+            exec.emit_p2id
+        end
+    end
+end
+
+#! Burns liquidity from the kernel-read sender's position: settles fees and principal
+#! into tokensOwed. No note is emitted.
+#!
+#! Reads `[pool_id_suffix, pool_id_prefix, tick_lower_off, tick_upper_off,
+#! liq_l0..liq_l3]` from the active note's storage. Authorization is structural: the
+#! position key derives from the kernel-read sender, so a non-owner addresses an empty
+#! position and the liquidity decrease underflows.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Panics if:
+#! - the note storage does not match the burn-note layout.
+#! - the note does not target this pool or the pool is uninitialized.
+#! - the tick range is invalid or the liquidity is zero / > i128::MAX.
+#! - the sender's position holds less liquidity than requested.
+#!
+#! Invocation: call
+@locals(28)
+pub proc burn
+    # ---- note storage (8 items) ----
+    locaddr.BU_STORAGE exec.active_note::get_storage
+    eq.8 assert.err=ERR_BURN_BAD_STORAGE
+
+    loc_load.ST_POOL_ID_PREFIX loc_load.ST_POOL_ID_SUFFIX
+    exec.active_account::get_id
+    exec.account_id::is_equal assert.err=ERR_NOTE_WRONG_POOL
+
+    exec.require_ready
+    loc_store.BU_TICK_CUR
+
+    push.POOL_PARAMS_SLOT[0..2] exec.active_account::get_item
+    drop u32assert loc_store.BU_SPACING drop drop
+    loc_load.BU_SPACING
+    loc_load.BURN_ST_TICK_UPPER loc_load.BURN_ST_TICK_LOWER
+    exec.validate_tick_range
+
+    # ---- liquidity to burn ----
+    loc_load.BURN_ST_LIQ_L3 u32assert
+    dup u32lt.0x80000000 assert.err=ERR_LIQUIDITY_EXCEEDS_I128
+    loc_load.BURN_ST_LIQ_L2 u32assert
+    loc_load.BURN_ST_LIQ_L1 u32assert
+    loc_load.BURN_ST_LIQ_L0 u32assert
+    loc_storew_le.BU_LIQ dropw
+    padw loc_loadw_le.BU_LIQ exec.u128::eqz assertz.err=ERR_BURN_ZERO_LIQUIDITY
+    padw loc_loadw_le.BU_LIQ exec.u128_neg loc_storew_le.BU_NEG_LIQ dropw
+
+    exec.active_note::get_sender
+    loc_store.BU_SENDER_SUFFIX loc_store.BU_SENDER_PREFIX
+
+    # ---- principal owed, rounded down (pool-favoring) ----
+    push.SQRT_PRICE_SLOT[0..2] exec.active_account::get_item
+    loc_storew_le.BU_SQRT dropw
+    locaddr.BU_SQRT locaddr.BU_LIQ push.0 loc_load.BU_TICK_CUR
+    loc_load.BURN_ST_TICK_UPPER loc_load.BURN_ST_TICK_LOWER
+    exec.amounts_for_liquidity
+    # => [AMOUNT0, AMOUNT1]
+    exec.u128_to_amount_felt loc_store.BU_AMOUNT0
+    exec.u128_to_amount_felt loc_store.BU_AMOUNT1
+
+    # ---- position update with the negated delta ----
+    locaddr.BU_NEG_LIQ loc_load.BU_TICK_CUR
+    loc_load.BURN_ST_TICK_UPPER loc_load.BURN_ST_TICK_LOWER
+    loc_load.BU_SENDER_PREFIX loc_load.BU_SENDER_SUFFIX
+    exec.update_position
+
+    # ---- active liquidity when the range is in scope ----
+    loc_load.BURN_ST_TICK_LOWER loc_load.BU_TICK_CUR lte
+    loc_load.BU_TICK_CUR loc_load.BURN_ST_TICK_UPPER lt
+    and
+    if.true
+        push.LIQUIDITY_SLOT[0..2] exec.active_account::get_item
+        padw loc_loadw_le.BU_NEG_LIQ
+        exec.liq_add_delta
+        push.LIQUIDITY_SLOT[0..2] exec.native_account::set_item dropw
+    end
+
+    # ---- credit principal into tokensOwed ----
+    loc_load.BU_AMOUNT0 loc_load.BU_AMOUNT1 add neq.0
+    if.true
+        loc_load.BU_AMOUNT1 loc_load.BU_AMOUNT0
+        # => [add0, add1]
+        loc_load.BURN_ST_TICK_UPPER loc_load.BURN_ST_TICK_LOWER
+        loc_load.BU_SENDER_PREFIX loc_load.BU_SENDER_SUFFIX
+        exec.position_base
+        # => [h0, h1, h2, add0, add1]
+        exec.add_tokens_owed
+    end
+end
+
+#! Pays out the kernel-read sender's tokensOwed via a single P2ID note and zeroes the
+#! record.
+#!
+#! Reads `[pool_id_suffix, pool_id_prefix, tick_lower_off, tick_upper_off]` from the
+#! active note's storage.
+#!
+#! Inputs:  [pad(16)]
+#! Outputs: [pad(16)]
+#!
+#! Panics if:
+#! - the note storage does not match the collect-note layout.
+#! - the note does not target this pool or the pool is uninitialized.
+#! - nothing is owed to the sender's position.
+#!
+#! Invocation: call
+@locals(32)
+pub proc collect
+    # ---- note storage (4 items) ----
+    locaddr.CO_STORAGE exec.active_note::get_storage
+    eq.4 assert.err=ERR_COLLECT_BAD_STORAGE
+
+    loc_load.ST_POOL_ID_PREFIX loc_load.ST_POOL_ID_SUFFIX
+    exec.active_account::get_id
+    exec.account_id::is_equal assert.err=ERR_NOTE_WRONG_POOL
+
+    exec.require_ready drop
+
+    # decode-range sanity on the tick offsets (mirrors the Rust decode_tick assert)
+    loc_load.COLLECT_ST_TICK_LOWER u32assert
+    u32lte.MAX_TICK_OFF_ENCODED assert.err=ERR_TICK_OUT_OF_RANGE
+    loc_load.COLLECT_ST_TICK_UPPER u32assert
+    u32lte.MAX_TICK_OFF_ENCODED assert.err=ERR_TICK_OUT_OF_RANGE
+
+    exec.active_note::get_sender
+    loc_store.CO_SENDER_SUFFIX loc_store.CO_SENDER_PREFIX
+
+    loc_load.COLLECT_ST_TICK_UPPER loc_load.COLLECT_ST_TICK_LOWER
+    loc_load.CO_SENDER_PREFIX loc_load.CO_SENDER_SUFFIX
+    exec.position_base
+    loc_store.CO_H0 loc_store.CO_H1 loc_store.CO_H2
+
+    push.POS_TOKENS_OWED loc_load.CO_H2 loc_load.CO_H1 loc_load.CO_H0
+    exec.pos_map_get
+    # => [owed0, owed1, 0, 0]
+    loc_store.CO_OWED0 loc_store.CO_OWED1 drop drop
+    loc_load.CO_OWED0 loc_load.CO_OWED1 add neq.0
+    assert.err=ERR_COLLECT_NOTHING
+
+    # zero the owed record
+    padw
+    push.POS_TOKENS_OWED loc_load.CO_H2 loc_load.CO_H1 loc_load.CO_H0
+    exec.pos_map_set
+
+    # build the payout assets and emit one P2ID note
+    push.0 loc_store.CO_COUNT
+    loc_load.CO_OWED0 neq.0
+    if.true
+        loc_load.CO_OWED0 push.0
+        exec.make_pool_asset
+        loc_storew_le.CO_ASSET0_KEY dropw
+        loc_storew_le.CO_ASSET0_VALUE dropw
+        push.1 loc_store.CO_COUNT
+    end
+    loc_load.CO_OWED1 neq.0
+    if.true
+        loc_load.CO_COUNT mul.8 locaddr.CO_ASSETS add loc_store.CO_SCRATCH
+        loc_load.CO_OWED1 push.1
+        exec.make_pool_asset
+        loc_load.CO_SCRATCH mem_storew_le dropw
+        loc_load.CO_SCRATCH add.4 mem_storew_le dropw
+        loc_load.CO_COUNT add.1 loc_store.CO_COUNT
+    end
+    loc_load.CO_COUNT locaddr.CO_ASSETS push.SALT_COLLECT
+    loc_load.CO_SENDER_PREFIX loc_load.CO_SENDER_SUFFIX
+    exec.emit_p2id
+end
+
+# HELPER PROCEDURES
+# =================================================================================================
+
+#! Asserts the pool is initialized and returns the current offset-encoded tick.
+#!
+#! Inputs:  []
+#! Outputs: [tick_off]
+#!
+#! Panics if:
+#! - the pool_state initialized flag is not set.
+#! - the stored tick offset is out of the encoding range.
+#!
+#! Invocation: exec
+proc require_ready() -> u32
+    push.POOL_STATE_SLOT[0..2] exec.active_account::get_item
+    # => [tick_off, init_flag, 0, 0]
+    swap assert.err=ERR_POOL_NOT_INITIALIZED
+    movup.2 drop swap drop
+    # => [tick_off]
+    dup lte.MAX_TICK_OFF_ENCODED assert.err=ERR_STORED_TICK_OUT_OF_RANGE
+    u32assert
+end
+
+#! Returns whether two words are equal.
+#!
+#! Inputs:  [B, A]
+#! Outputs: [is_equal]
+#!
+#! Invocation: exec
+proc eq_words(b: word, a: word) -> i1
+    movup.4 eq
+    # => [e0, b1, b2, b3, a1, a2, a3]
+    movdn.6
+    movup.3 eq
+    movdn.4
+    movup.2 eq
+    movdn.2
+    eq
+    # => [e3, e2, e1, e0]
+    and and and
+end
+
+#! Reads a tick record word from the ticks map.
+#!
+#! Inputs:  [tick_off, group]
+#! Outputs: [VALUE]
+#!
+#! Invocation: exec
+proc tick_map_get(tick_off: u32, group: u32) -> word
+    push.0 movdn.2 push.0 movdn.3
+    # => [KEY]
+    push.TICKS_SLOT[0..2]
+    exec.active_account::get_map_item
+end
+
+#! Writes a tick record word to the ticks map.
+#!
+#! Inputs:  [tick_off, group, VALUE]
+#! Outputs: []
+#!
+#! Invocation: exec
+proc tick_map_set(tick_off: u32, group: u32, value: word)
+    push.0 movdn.2 push.0 movdn.3
+    # => [KEY, VALUE]
+    push.TICKS_SLOT[0..2]
+    exec.native_account::set_map_item
+    dropw
+end
+
+#! Reads a 128-position bitmap word.
+#!
+#! Inputs:  [word_index]
+#! Outputs: [VALUE]
+#!
+#! Invocation: exec
+proc bitmap_get(word_index: u32) -> word
+    push.0 swap push.0 movdn.2 push.0 movdn.3
+    push.TICK_BITMAP_SLOT[0..2]
+    exec.active_account::get_map_item
+end
+
+#! Writes a 128-position bitmap word.
+#!
+#! Inputs:  [word_index, VALUE]
+#! Outputs: []
+#!
+#! Invocation: exec
+proc bitmap_set(word_index: u32, value: word)
+    push.0 swap push.0 movdn.2 push.0 movdn.3
+    push.TICK_BITMAP_SLOT[0..2]
+    exec.native_account::set_map_item
+    dropw
+end
+
+#! Reads a position record word.
+#!
+#! Inputs:  [h0, h1, h2, field_id]
+#! Outputs: [VALUE]
+#!
+#! Invocation: exec
+proc pos_map_get(h0: felt, h1: felt, h2: felt, field_id: u32) -> word
+    push.POSITIONS_SLOT[0..2]
+    exec.active_account::get_map_item
+end
+
+#! Writes a position record word.
+#!
+#! Inputs:  [h0, h1, h2, field_id, VALUE]
+#! Outputs: []
+#!
+#! Invocation: exec
+proc pos_map_set(h0: felt, h1: felt, h2: felt, field_id: u32, value: word)
+    push.POSITIONS_SLOT[0..2]
+    exec.native_account::set_map_item
+    dropw
+end
+
+#! Reads feeGrowthGlobal0 as a u256 (8 limbs, limb 0 on top).
+#!
+#! Inputs:  []
+#! Outputs: [g0, g1, g2, g3, g4, g5, g6, g7]
+#!
+#! Invocation: exec
+proc read_fg0() -> u256::u256
+    push.FG0_HI_SLOT[0..2] exec.active_account::get_item
+    push.FG0_LO_SLOT[0..2] exec.active_account::get_item
+end
+
+#! Reads feeGrowthGlobal1 as a u256 (8 limbs, limb 0 on top).
+#!
+#! Inputs:  []
+#! Outputs: [g0, g1, g2, g3, g4, g5, g6, g7]
+#!
+#! Invocation: exec
+proc read_fg1() -> u256::u256
+    push.FG1_HI_SLOT[0..2] exec.active_account::get_item
+    push.FG1_LO_SLOT[0..2] exec.active_account::get_item
+end
+
+#! Writes feeGrowthGlobal0 from a u256 (8 limbs, limb 0 on top).
+#!
+#! Inputs:  [g0, g1, g2, g3, g4, g5, g6, g7]
+#! Outputs: []
+#!
+#! Invocation: exec
+proc write_fg0(value: u256::u256)
+    push.FG0_LO_SLOT[0..2] exec.native_account::set_item dropw
+    push.FG0_HI_SLOT[0..2] exec.native_account::set_item dropw
+end
+
+#! Writes feeGrowthGlobal1 from a u256 (8 limbs, limb 0 on top).
+#!
+#! Inputs:  [g0, g1, g2, g3, g4, g5, g6, g7]
+#! Outputs: []
+#!
+#! Invocation: exec
+proc write_fg1(value: u256::u256)
+    push.FG1_LO_SLOT[0..2] exec.native_account::set_item dropw
+    push.FG1_HI_SLOT[0..2] exec.native_account::set_item dropw
+end
+
+#! Negates a u128 (two's complement).
+#!
+#! Inputs:  [a0, a1, a2, a3]
+#! Outputs: [n0, n1, n2, n3]
+#!
+#! Invocation: exec
+proc u128_neg(a: u128) -> u128
+    padw swapw
+    exec.u128::wrapping_sub
+end
+
+#! Applies a signed liquidity delta to a u128 (Uniswap LiquidityMath.addDelta).
+#!
+#! Inputs:  [d0, d1, d2, d3, l0, l1, l2, l3]
+#! Outputs: [z0, z1, z2, z3]
+#!
+#! Where:
+#! - d0..d3 are the two's-complement limbs of the i128 delta (d0 least significant).
+#! - l0..l3 are the limbs of the u128 liquidity.
+#! - z0..z3 are the limbs of liquidity + delta.
+#!
+#! Panics if:
+#! - a negative delta exceeds the liquidity (underflow).
+#! - a positive delta overflows u128.
+#!
+#! Invocation: exec
+proc liq_add_delta(delta: u128, liquidity: u128) -> u128
+    dup.3 u32shr.31
+    if.true
+        exec.u128_neg
+        # => [m, l]  (m = |delta|)
+        dupw.1 dupw.1
+        exec.u128::gte assert.err=ERR_LIQUIDITY_UNDERFLOW
+        exec.u128::wrapping_sub
+    else
+        exec.u128::overflowing_add
+        assertz.err=ERR_LIQUIDITY_OVERFLOW
+    end
+end
+
+#! Checked i128 addition on two's-complement u128 limb patterns.
+#!
+#! Inputs:  [b0, b1, b2, b3, a0, a1, a2, a3]
+#! Outputs: [s0, s1, s2, s3]
+#!
+#! Panics if:
+#! - the signed addition overflows i128.
+#!
+#! Invocation: exec
+@locals(4)
+proc i128_checked_add(b: u128, a: u128) -> u128
+    dup.3 u32shr.31 loc_store.0
+    dup.7 u32shr.31 loc_store.1
+    exec.u128::wrapping_add
+    # => [s]
+    dup.3 u32shr.31
+    loc_load.0 loc_load.1 eq
+    # => [signs_equal, sign_s, s]
+    swap loc_load.0 neq
+    # => [sign_changed, signs_equal, s]
+    and assertz.err=ERR_LIQUIDITY_NET_OVERFLOW
+end
+
+#! Checked i128 subtraction (a - b) on two's-complement u128 limb patterns.
+#!
+#! Inputs:  [b0, b1, b2, b3, a0, a1, a2, a3]
+#! Outputs: [s0, s1, s2, s3]
+#!
+#! Panics if:
+#! - the signed subtraction overflows i128.
+#!
+#! Invocation: exec
+proc i128_checked_sub(b: u128, a: u128) -> u128
+    exec.u128_neg
+    exec.i128_checked_add
+end
+
+#! Adds two u64-range felts with an overflow check, keeping the sum below the felt
+#! modulus.
+#!
+#! Inputs:  [b, a]
+#! Outputs: [sum]
+#!
+#! Panics if:
+#! - the u64 addition overflows or the sum does not fit a felt.
+#!
+#! Invocation: exec
+proc u64f_checked_add(b: felt, a: felt) -> felt
+    u32split
+    movup.2 u32split
+    exec.u64::overflowing_add
+    assertz.err=ERR_TOKENS_OWED_OVERFLOW
+    # => [s_lo, s_hi]
+    dup.1 dup.1
+    push.FELT_MOD_HI push.FELT_MOD_LO
+    exec.u64::lt assert.err=ERR_TOKENS_OWED_OVERFLOW
+    swap mul.MAX_U32 add
+end
+
+#! Converts a u128 known to fit an asset amount (< 2^63) into a single felt.
+#!
+#! Inputs:  [x0, x1, x2, x3]
+#! Outputs: [amount]
+#!
+#! Panics if:
+#! - the value is >= 2^63.
+#!
+#! Invocation: exec
+proc u128_to_amount_felt(x: u128) -> felt
+    movup.3 assertz.err=ERR_AMOUNT_EXCEEDS_U64
+    movup.2 assertz.err=ERR_AMOUNT_EXCEEDS_U64
+    # => [x0, x1]
+    dup.1 lt.0x80000000 assert.err=ERR_AMOUNT_EXCEEDS_U64
+    swap mul.MAX_U32 add
+end
+
+#! Compressed-tick offset: floor((tick_off - 2^19) / spacing) + 2^19, computed as
+#! floor((tick_off + 2^19 * (spacing - 1)) / spacing) to stay unsigned.
+#!
+#! Inputs:  [tick_off, spacing]
+#! Outputs: [c_off]
+#!
+#! Invocation: exec
+proc compressed_off(tick_off: felt, spacing: u32) -> u32
+    dup.1 sub.1 mul.TICK_OFFSET add
+    # => [numer, spacing]
+    u32split
+    movup.2 push.0 swap
+    # => [spacing, 0, n_lo, n_hi]
+    exec.u64::div
+    swap drop
+    # => [c_off]
+end
+
+#! Asserts a tick offset is aligned to the tick spacing.
+#!
+#! Inputs:  [tick_off, spacing]
+#! Outputs: []
+#!
+#! Panics if:
+#! - the decoded tick is not a multiple of the spacing.
+#!
+#! Invocation: exec
+proc assert_tick_aligned(tick_off: felt, spacing: u32)
+    dup.1 sub.1 mul.TICK_OFFSET add
+    u32split
+    movup.2 push.0 swap
+    exec.u64::mod
+    # => [r_lo, r_hi]
+    add eq.0 assert.err=ERR_TICK_NOT_ALIGNED
+end
+
+#! Validates a (lower, upper) tick range: bounds, ordering, spacing alignment.
+#!
+#! Inputs:  [lower_off, upper_off, spacing]
+#! Outputs: []
+#!
+#! Panics if:
+#! - either offset is not a u32 or outside [OFF_MIN_TICK, OFF_MAX_TICK].
+#! - lower >= upper, or either tick is misaligned.
+#!
+#! Invocation: exec
+proc validate_tick_range(lower_off: felt, upper_off: felt, spacing: u32)
+    u32assert2
+    dup u32gte.OFF_MIN_TICK assert.err=ERR_TICK_OUT_OF_RANGE
+    dup.1 u32lte.OFF_MAX_TICK assert.err=ERR_TICK_OUT_OF_RANGE
+    dup dup.2 u32lt assert.err=ERR_TICK_ORDER
+    # => [lower, upper, spacing]
+    dup.2 swap exec.assert_tick_aligned
+    # => [upper, spacing]
+    exec.assert_tick_aligned
+end
+
+#! Converts a compressed-tick offset back to a clamped, offset-encoded tick:
+#! ((c_off - 2^19) * spacing) clamped to [MIN_TICK, MAX_TICK].
+#!
+#! Inputs:  [c_off, spacing]
+#! Outputs: [tick_off]
+#!
+#! Invocation: exec
+proc clamped_tick_off(c_off: u32, spacing: u32) -> u32
+    dup.1 mul.TICK_OFFSET
+    push.TICK_BIAS swap sub
+    # => [TICK_BIAS - spacing * 2^19, c_off, spacing]
+    movdn.2 mul add
+    # => [biased_tick]
+    dup lt.BIASED_MIN_TICK
+    if.true drop push.BIASED_MIN_TICK end
+    dup gt.BIASED_MAX_TICK
+    if.true drop push.BIASED_MAX_TICK end
+    sub.BIAS_MINUS_OFFSET
+    # => [tick_off]
+end
+
+#! Finds the next initialized tick within one 128-bit bitmap word
+#! (Uniswap TickBitmap.nextInitializedTickWithinOneWord over 128-position words).
+#!
+#! Inputs:  [tick_off, spacing, lte_flag]
+#! Outputs: [next_tick_off, initialized]
+#!
+#! Where:
+#! - lte_flag is 1 when searching downwards (zero_for_one), 0 upwards.
+#! - next_tick_off is the offset-encoded next tick, clamped to the supported range.
+#! - initialized is 1 when the returned tick carries liquidity.
+#!
+#! Invocation: exec
+@locals(4)
+proc next_init_tick(tick_off: felt, spacing: u32, lte_flag: i1) -> (initialized: i1, next_tick_off: u32)
+    movup.2 loc_store.NIT_LTE
+    dup.1 loc_store.NIT_SPACING
+    exec.compressed_off
+    # => [c]
+    loc_load.NIT_LTE not
+    if.true
+        add.1
+    end
+    # => [c_off]
+    dup u32shr.7 loc_store.NIT_WORD_INDEX
+    push.127 u32and
+    loc_store.NIT_BIT
+    loc_load.NIT_WORD_INDEX exec.bitmap_get
+    # => [W]
+    loc_load.NIT_LTE
+    if.true
+        # mask = bit == 127 ? 2^128 - 1 : (1 << (bit + 1)) - 1
+        loc_load.NIT_BIT eq.127
+        if.true
+            push.0xFFFFFFFF push.0xFFFFFFFF push.0xFFFFFFFF push.0xFFFFFFFF
+        else
+            push.0.0.0.1
+            loc_load.NIT_BIT add.1
+            exec.u128::shl
+            push.0.0.0.1
+            exec.u128::wrapping_sub
+        end
+        exec.u128::and
+        # => [masked]
+        dupw exec.u128::eqz
+        if.true
+            dropw
+            push.0 loc_load.NIT_WORD_INDEX mul.128
+            # => [next_c, 0]
+        else
+            exec.u128::clz
+            push.127 swap sub
+            # => [msb]
+            loc_load.NIT_WORD_INDEX mul.128 add
+            push.1 swap
+            # => [next_c, 1]
+        end
+    else
+        # mask = not((1 << bit) - 1)
+        push.0.0.0.1
+        loc_load.NIT_BIT
+        exec.u128::shl
+        push.0.0.0.1
+        exec.u128::wrapping_sub
+        exec.u128::not
+        exec.u128::and
+        dupw exec.u128::eqz
+        if.true
+            dropw
+            push.0 loc_load.NIT_WORD_INDEX mul.128 add.127
+            # => [next_c, 0]
+        else
+            exec.u128::ctz
+            loc_load.NIT_WORD_INDEX mul.128 add
+            push.1 swap
+            # => [next_c, 1]
+        end
+    end
+    # => [next_c, initialized]
+    loc_load.NIT_SPACING swap
+    exec.clamped_tick_off
+    # => [next_tick_off, initialized]
+end
+
+#! Flips the bitmap bit of an (aligned) tick.
+#!
+#! Inputs:  [tick_off, spacing]
+#! Outputs: []
+#!
+#! Invocation: exec
+@locals(4)
+proc bitmap_flip(tick_off: felt, spacing: u32)
+    exec.compressed_off
+    dup u32shr.7 loc_store.0
+    push.127 u32and
+    # => [bit]
+    push.0.0.0.1 movup.4
+    exec.u128::shl
+    # => [BITVAL]
+    loc_load.0 exec.bitmap_get
+    exec.u128::xor
+    # => [NEW]
+    loc_load.0 exec.bitmap_set
+end
+
+#! Crosses an initialized tick (Uniswap Tick.cross): flips both fgOutside
+#! accumulators against the current globals and returns the tick's liquidityNet.
+#!
+#! Inputs:  [tick_off, zero_for_one, fg_in_ptr]
+#! Outputs: [n0, n1, n2, n3]
+#!
+#! Where:
+#! - fg_in_ptr is the memory address of the 8-limb in-direction fee-growth
+#!   accumulator (feeGrowthGlobal0 when zero_for_one, else feeGrowthGlobal1).
+#! - n0..n3 are the two's-complement limbs of the tick's liquidityNet.
+#!
+#! Invocation: exec
+@locals(4)
+proc cross_tick(tick_off: u32, zero_for_one: i1, fg_in_ptr: u32) -> u128
+    loc_store.CT_TICK
+    loc_store.CT_ZFO
+    loc_store.CT_FG_IN_PTR
+    # ---- fgOutside0' = fg0_now - fgOutside0 ----
+    loc_load.CT_ZFO
+    if.true
+        padw loc_load.CT_FG_IN_PTR add.4 mem_loadw_le
+        padw loc_load.CT_FG_IN_PTR mem_loadw_le
+        # => [LO, HI]
+    else
+        exec.read_fg0
+    end
+    push.TICK_FG0_HI loc_load.CT_TICK exec.tick_map_get
+    push.TICK_FG0_LO loc_load.CT_TICK exec.tick_map_get
+    # => [OUTSIDE0 (8 limbs), FG0_NOW (8 limbs)]
+    exec.fee_growth::u256_wrapping_sub
+    push.TICK_FG0_LO loc_load.CT_TICK exec.tick_map_set
+    push.TICK_FG0_HI loc_load.CT_TICK exec.tick_map_set
+    # ---- fgOutside1' = fg1_now - fgOutside1 ----
+    loc_load.CT_ZFO
+    if.true
+        exec.read_fg1
+    else
+        padw loc_load.CT_FG_IN_PTR add.4 mem_loadw_le
+        padw loc_load.CT_FG_IN_PTR mem_loadw_le
+    end
+    push.TICK_FG1_HI loc_load.CT_TICK exec.tick_map_get
+    push.TICK_FG1_LO loc_load.CT_TICK exec.tick_map_get
+    exec.fee_growth::u256_wrapping_sub
+    push.TICK_FG1_LO loc_load.CT_TICK exec.tick_map_set
+    push.TICK_FG1_HI loc_load.CT_TICK exec.tick_map_set
+    # ---- liquidityNet ----
+    push.TICK_LIQ_NET loc_load.CT_TICK exec.tick_map_get
+end
+
+#! Uniswap Tick.update: applies a liquidity delta to a tick record and reports
+#! whether the tick flipped between initialized and uninitialized.
+#!
+#! Inputs:  [tick_off, tick_cur_off, upper_flag, delta_ptr]
+#! Outputs: [flipped]
+#!
+#! Where:
+#! - upper_flag is 1 when the tick is the range's upper bound.
+#! - delta_ptr is the memory address of the 4-limb i128 delta.
+#!
+#! Invocation: exec
+@locals(16)
+proc tick_update(tick_off: u32, tick_cur_off: u32, upper_flag: i1, delta_ptr: u32) -> i1
+    loc_store.TU_TICK
+    loc_store.TU_TICK_CUR
+    loc_store.TU_UPPER
+    loc_store.TU_DELTA_PTR
+    push.TICK_LIQ_GROSS loc_load.TU_TICK exec.tick_map_get
+    loc_storew_le.TU_GROSS_BEFORE
+    # => [GROSS_BEFORE]
+    padw loc_load.TU_DELTA_PTR mem_loadw_le
+    exec.liq_add_delta
+    loc_storew_le.TU_GROSS_AFTER dropw
+    padw loc_loadw_le.TU_GROSS_AFTER exec.u128::eqz
+    padw loc_loadw_le.TU_GROSS_BEFORE exec.u128::eqz
+    neq
+    loc_store.TU_FLIPPED
+    # fgOutside initialization convention: everything before initialization
+    # happened below the tick (Uniswap)
+    padw loc_loadw_le.TU_GROSS_BEFORE exec.u128::eqz
+    loc_load.TU_TICK loc_load.TU_TICK_CUR lte
+    and
+    if.true
+        push.FG0_LO_SLOT[0..2] exec.active_account::get_item
+        push.TICK_FG0_LO loc_load.TU_TICK exec.tick_map_set
+        push.FG0_HI_SLOT[0..2] exec.active_account::get_item
+        push.TICK_FG0_HI loc_load.TU_TICK exec.tick_map_set
+        push.FG1_LO_SLOT[0..2] exec.active_account::get_item
+        push.TICK_FG1_LO loc_load.TU_TICK exec.tick_map_set
+        push.FG1_HI_SLOT[0..2] exec.active_account::get_item
+        push.TICK_FG1_HI loc_load.TU_TICK exec.tick_map_set
+    end
+    padw loc_loadw_le.TU_GROSS_AFTER
+    push.TICK_LIQ_GROSS loc_load.TU_TICK exec.tick_map_set
+    # liquidityNet: upper subtracts the delta, lower adds it
+    push.TICK_LIQ_NET loc_load.TU_TICK exec.tick_map_get
+    padw loc_load.TU_DELTA_PTR mem_loadw_le
+    # => [DELTA, NET_BEFORE]
+    loc_load.TU_UPPER
+    if.true
+        exec.i128_checked_sub
+    else
+        exec.i128_checked_add
+    end
+    push.TICK_LIQ_NET loc_load.TU_TICK exec.tick_map_set
+    loc_load.TU_FLIPPED
+end
+
+#! Deletes all field groups of a tick record (Uniswap Tick.clear).
+#!
+#! Inputs:  [tick_off]
+#! Outputs: []
+#!
+#! Invocation: exec
+@locals(4)
+proc clear_tick(tick_off: u32)
+    loc_store.0
+    push.0
+    repeat.6
+        # => [g]
+        padw dup.4 loc_load.0
+        # => [tick_off, g, EMPTY_WORD, g]
+        exec.tick_map_set
+        add.1
+    end
+    drop
+end
+
+#! Computes the fee growth inside a tick range for both accumulators
+#! (Uniswap Tick.getFeeGrowthInside, wrapping u256 arithmetic) and writes
+#! inside0 to out_ptr..out_ptr+7 and inside1 to out_ptr+8..out_ptr+15.
+#!
+#! Inputs:  [lower_off, upper_off, tick_cur_off, out_ptr]
+#! Outputs: []
+#!
+#! Invocation: exec
+@locals(4)
+proc fee_growth_inside(lower_off: u32, upper_off: u32, tick_cur_off: u32, out_ptr: u32)
+    loc_store.FI_LOWER
+    loc_store.FI_UPPER
+    loc_store.FI_TICK_CUR
+    loc_store.FI_OUT_PTR
+    # ---- token0 ----
+    # below0
+    loc_load.FI_LOWER loc_load.FI_TICK_CUR lte
+    if.true
+        push.TICK_FG0_HI loc_load.FI_LOWER exec.tick_map_get
+        push.TICK_FG0_LO loc_load.FI_LOWER exec.tick_map_get
+    else
+        exec.read_fg0
+        push.TICK_FG0_HI loc_load.FI_LOWER exec.tick_map_get
+        push.TICK_FG0_LO loc_load.FI_LOWER exec.tick_map_get
+        exec.fee_growth::u256_wrapping_sub
+    end
+    # => [BELOW0 (8 limbs)]
+    # above0
+    loc_load.FI_TICK_CUR loc_load.FI_UPPER lt
+    if.true
+        push.TICK_FG0_HI loc_load.FI_UPPER exec.tick_map_get
+        push.TICK_FG0_LO loc_load.FI_UPPER exec.tick_map_get
+    else
+        exec.read_fg0
+        push.TICK_FG0_HI loc_load.FI_UPPER exec.tick_map_get
+        push.TICK_FG0_LO loc_load.FI_UPPER exec.tick_map_get
+        exec.fee_growth::u256_wrapping_sub
+    end
+    # => [ABOVE0 (8), BELOW0 (8)]
+    exec.read_fg0
+    swapdw
+    # => [ABOVE0, FG0, BELOW0]
+    exec.fee_growth::u256_wrapping_sub
+    # => [FG0 - ABOVE0, BELOW0]
+    swapdw
+    # => [BELOW0, FG0 - ABOVE0]
+    exec.fee_growth::u256_wrapping_sub
+    # => [INSIDE0 (8 limbs)]
+    loc_load.FI_OUT_PTR mem_storew_le dropw
+    loc_load.FI_OUT_PTR add.4 mem_storew_le dropw
+    # ---- token1 ----
+    loc_load.FI_LOWER loc_load.FI_TICK_CUR lte
+    if.true
+        push.TICK_FG1_HI loc_load.FI_LOWER exec.tick_map_get
+        push.TICK_FG1_LO loc_load.FI_LOWER exec.tick_map_get
+    else
+        exec.read_fg1
+        push.TICK_FG1_HI loc_load.FI_LOWER exec.tick_map_get
+        push.TICK_FG1_LO loc_load.FI_LOWER exec.tick_map_get
+        exec.fee_growth::u256_wrapping_sub
+    end
+    loc_load.FI_TICK_CUR loc_load.FI_UPPER lt
+    if.true
+        push.TICK_FG1_HI loc_load.FI_UPPER exec.tick_map_get
+        push.TICK_FG1_LO loc_load.FI_UPPER exec.tick_map_get
+    else
+        exec.read_fg1
+        push.TICK_FG1_HI loc_load.FI_UPPER exec.tick_map_get
+        push.TICK_FG1_LO loc_load.FI_UPPER exec.tick_map_get
+        exec.fee_growth::u256_wrapping_sub
+    end
+    exec.read_fg1
+    swapdw
+    exec.fee_growth::u256_wrapping_sub
+    swapdw
+    exec.fee_growth::u256_wrapping_sub
+    # => [INSIDE1 (8 limbs)]
+    loc_load.FI_OUT_PTR add.8 mem_storew_le dropw
+    loc_load.FI_OUT_PTR add.12 mem_storew_le dropw
+end
+
+#! Poseidon2 position-key base: hash of (owner_suffix, owner_prefix, tick_lower_off,
+#! tick_upper_off, POSITION_DOMAIN), truncated to 3 felts. Identical to the Rust
+#! component's and the testbed's host-side derivation.
+#!
+#! Inputs:  [owner_suffix, owner_prefix, tick_lower_off, tick_upper_off]
+#! Outputs: [h0, h1, h2]
+#!
+#! Invocation: exec
+@locals(8)
+proc position_base(owner_suffix: felt, owner_prefix: felt, tick_lower_off: u32, tick_upper_off: u32) -> (h0: felt, h1: felt, h2: felt)
+    loc_store.0
+    loc_store.1
+    loc_store.2
+    loc_store.3
+    push.POSITION_DOMAIN loc_store.4
+    # locals 5..7 may hold stale frame data; hash_elements zeroes the padding
+    # elements on the stack, so their contents never reach the hash
+    push.5 locaddr.0
+    exec.poseidon2::hash_elements
+    # => [h0, h1, h2, h3]
+    movup.3 drop
+end
+
+#! Adds amounts to the position's [tokensOwed0, tokensOwed1] record.
+#!
+#! Inputs:  [h0, h1, h2, add0, add1]
+#! Outputs: []
+#!
+#! Panics if:
+#! - either accumulated amount overflows u64 or the felt range.
+#!
+#! Invocation: exec
+@locals(8)
+proc add_tokens_owed(h0: felt, h1: felt, h2: felt, add0: felt, add1: felt)
+    loc_store.0
+    loc_store.1
+    loc_store.2
+    loc_store.3
+    loc_store.4
+    push.POS_TOKENS_OWED loc_load.2 loc_load.1 loc_load.0
+    exec.pos_map_get
+    # => [owed0, owed1, 0, 0]
+    loc_load.3 exec.u64f_checked_add
+    # => [owed0', owed1, 0, 0]
+    swap loc_load.4 exec.u64f_checked_add
+    # => [owed1', owed0', 0, 0]
+    movup.2 drop movup.2 drop
+    swap
+    push.0 movdn.2 push.0 movdn.3
+    # => [owed0', owed1', 0, 0]
+    push.POS_TOKENS_OWED loc_load.2 loc_load.1 loc_load.0
+    exec.pos_map_set
+end
+
+#! Uniswap _updatePosition: tick updates, bitmap flips, fee settlement into the
+#! position record, snapshot refresh, and tick clearing on emptying burns.
+#!
+#! Inputs:  [owner_suffix, owner_prefix, lower_off, upper_off, tick_cur_off, delta_ptr]
+#! Outputs: []
+#!
+#! Where:
+#! - delta_ptr is the memory address of the 4-limb i128 liquidity delta (never zero).
+#!
+#! Invocation: exec
+@locals(40)
+proc update_position(owner_suffix: felt, owner_prefix: felt, lower_off: u32, upper_off: u32, tick_cur_off: u32, delta_ptr: u32)
+    loc_store.UP_OWNER_SUFFIX
+    loc_store.UP_OWNER_PREFIX
+    loc_store.UP_LOWER
+    loc_store.UP_UPPER
+    loc_store.UP_TICK_CUR
+    loc_store.UP_DELTA_PTR
+    push.POOL_PARAMS_SLOT[0..2] exec.active_account::get_item
+    drop u32assert loc_store.UP_SPACING drop drop
+
+    # ---- tick updates + bitmap flips ----
+    loc_load.UP_DELTA_PTR push.0 loc_load.UP_TICK_CUR loc_load.UP_LOWER
+    exec.tick_update
+    loc_store.UP_FLIPPED_LOWER
+    loc_load.UP_DELTA_PTR push.1 loc_load.UP_TICK_CUR loc_load.UP_UPPER
+    exec.tick_update
+    loc_store.UP_FLIPPED_UPPER
+    loc_load.UP_FLIPPED_LOWER
+    if.true
+        loc_load.UP_SPACING loc_load.UP_LOWER exec.bitmap_flip
+    end
+    loc_load.UP_FLIPPED_UPPER
+    if.true
+        loc_load.UP_SPACING loc_load.UP_UPPER exec.bitmap_flip
+    end
+
+    # ---- fee growth inside the range (after the tick updates, as in Uniswap) ----
+    locaddr.UP_INSIDE0_LO loc_load.UP_TICK_CUR loc_load.UP_UPPER loc_load.UP_LOWER
+    exec.fee_growth_inside
+
+    # ---- position record ----
+    loc_load.UP_UPPER loc_load.UP_LOWER
+    loc_load.UP_OWNER_PREFIX loc_load.UP_OWNER_SUFFIX
+    exec.position_base
+    loc_store.UP_H0 loc_store.UP_H1 loc_store.UP_H2
+    push.POS_LIQUIDITY loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0
+    exec.pos_map_get
+    loc_storew_le.UP_POS_LIQ dropw
+
+    # fees owed on both accumulators (only when the position holds liquidity)
+    padw loc_loadw_le.UP_POS_LIQ exec.u128::eqz not
+    if.true
+        # d0 = inside0 - last0
+        padw loc_loadw_le.UP_INSIDE0_HI padw loc_loadw_le.UP_INSIDE0_LO
+        push.POS_FG0_HI loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0 exec.pos_map_get
+        push.POS_FG0_LO loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0 exec.pos_map_get
+        # => [LAST0 (8), INSIDE0 (8)]
+        exec.fee_growth::u256_wrapping_sub
+        # => [D0 (8)]
+        dupw.1 dupw.1 exec.u256::eqz
+        if.true
+            dropw dropw
+            push.0.0.0.0
+        else
+            padw loc_loadw_le.UP_POS_LIQ movdnw.2
+            # => [D0 (8), POS_LIQ]
+            exec.fee_growth::liquidity_mul_delta_shr128
+        end
+        loc_storew_le.UP_FEES0 dropw
+        # d1 = inside1 - last1
+        padw loc_loadw_le.UP_INSIDE1_HI padw loc_loadw_le.UP_INSIDE1_LO
+        push.POS_FG1_HI loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0 exec.pos_map_get
+        push.POS_FG1_LO loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0 exec.pos_map_get
+        exec.fee_growth::u256_wrapping_sub
+        dupw.1 dupw.1 exec.u256::eqz
+        if.true
+            dropw dropw
+            push.0.0.0.0
+        else
+            padw loc_loadw_le.UP_POS_LIQ movdnw.2
+            exec.fee_growth::liquidity_mul_delta_shr128
+        end
+        loc_storew_le.UP_FEES1 dropw
+    else
+        padw loc_storew_le.UP_FEES0 dropw
+        padw loc_storew_le.UP_FEES1 dropw
+    end
+
+    # ---- new position liquidity + snapshots ----
+    padw loc_loadw_le.UP_POS_LIQ
+    padw loc_load.UP_DELTA_PTR mem_loadw_le
+    # => [DELTA, POS_LIQ]
+    exec.liq_add_delta
+    push.POS_LIQUIDITY loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0
+    exec.pos_map_set
+    padw loc_loadw_le.UP_INSIDE0_LO
+    push.POS_FG0_LO loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0
+    exec.pos_map_set
+    padw loc_loadw_le.UP_INSIDE0_HI
+    push.POS_FG0_HI loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0
+    exec.pos_map_set
+    padw loc_loadw_le.UP_INSIDE1_LO
+    push.POS_FG1_LO loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0
+    exec.pos_map_set
+    padw loc_loadw_le.UP_INSIDE1_HI
+    push.POS_FG1_HI loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0
+    exec.pos_map_set
+
+    # ---- credit fees into tokensOwed ----
+    padw loc_loadw_le.UP_FEES0 exec.u128::eqz not
+    padw loc_loadw_le.UP_FEES1 exec.u128::eqz not
+    or
+    if.true
+        padw loc_loadw_le.UP_FEES1 exec.u128_to_amount_felt
+        padw loc_loadw_le.UP_FEES0 exec.u128_to_amount_felt
+        # => [fees0, fees1]
+        loc_load.UP_H2 loc_load.UP_H1 loc_load.UP_H0
+        exec.add_tokens_owed
+    end
+
+    # ---- clear emptied ticks on burns (delta < 0) ----
+    padw loc_load.UP_DELTA_PTR mem_loadw_le
+    drop drop drop u32shr.31
+    if.true
+        loc_load.UP_FLIPPED_LOWER
+        if.true
+            loc_load.UP_LOWER exec.clear_tick
+        end
+        loc_load.UP_FLIPPED_UPPER
+        if.true
+            loc_load.UP_UPPER exec.clear_tick
+        end
+    end
+end
+
+#! Token amounts spanned by a liquidity over [lower, upper] at the current price
+#! (Uniswap _modifyPosition amount logic).
+#!
+#! Inputs:  [lower_off, upper_off, tick_cur_off, round_up, liq_ptr, price_ptr]
+#! Outputs: [a0_0, a0_1, a0_2, a0_3, a1_0, a1_1, a1_2, a1_3]
+#!
+#! Where:
+#! - liq_ptr / price_ptr are memory addresses of the 4-limb liquidity and sqrt price.
+#! - a0_* / a1_* are the u128 limbs of the token0 / token1 amounts (amount0 on top).
+#!
+#! Invocation: exec
+@locals(24)
+proc amounts_for_liquidity(lower_off: u32, upper_off: u32, tick_cur_off: u32, round_up: i1, liq_ptr: u32, price_ptr: u32) -> (amount1: u128, amount0: u128)
+    loc_store.0
+    loc_store.1
+    loc_store.2
+    loc_store.3
+    loc_store.4
+    loc_store.5
+    # 0=lower 1=upper 2=cur 3=round_up 4=liq_ptr 5=price_ptr
+    loc_load.0 exec.tick_math::get_sqrt_ratio_at_tick
+    loc_storew_le.8 dropw     # PL
+    loc_load.1 exec.tick_math::get_sqrt_ratio_at_tick
+    loc_storew_le.12 dropw    # PU
+    padw loc_storew_le.16 dropw   # AMOUNT0 = 0
+    padw loc_storew_le.20 dropw   # AMOUNT1 = 0
+    loc_load.2 loc_load.0 lt
+    # => [tick_cur < lower]
+    if.true
+        loc_load.3
+        padw loc_load.4 mem_loadw_le
+        padw loc_loadw_le.12
+        padw loc_loadw_le.8
+        exec.sqrt_price_math::get_amount0_delta
+        loc_storew_le.16 dropw
+    else
+        loc_load.2 loc_load.1 lt
+        # => [tick_cur < upper]
+        if.true
+            loc_load.3
+            padw loc_load.4 mem_loadw_le
+            padw loc_loadw_le.12
+            padw loc_load.5 mem_loadw_le
+            exec.sqrt_price_math::get_amount0_delta
+            loc_storew_le.16 dropw
+            loc_load.3
+            padw loc_load.4 mem_loadw_le
+            padw loc_load.5 mem_loadw_le
+            padw loc_loadw_le.8
+            exec.sqrt_price_math::get_amount1_delta
+            loc_storew_le.20 dropw
+        else
+            loc_load.3
+            padw loc_load.4 mem_loadw_le
+            padw loc_loadw_le.12
+            padw loc_loadw_le.8
+            exec.sqrt_price_math::get_amount1_delta
+            loc_storew_le.20 dropw
+        end
+    end
+    padw loc_loadw_le.20
+    padw loc_loadw_le.16
+    # => [AMOUNT0, AMOUNT1]
+end
+
+#! Builds the pool-token fungible asset for token index 0/1 through the kernel
+#! (never from raw felts).
+#!
+#! Inputs:  [token_index, amount]
+#! Outputs: [ASSET_KEY, ASSET_VALUE]
+#!
+#! Panics if:
+#! - the amount exceeds the maximum fungible asset amount.
+#!
+#! Invocation: exec
+proc make_pool_asset(token_index: i1, amount: felt) -> (value: word, key: word)
+    push.POOL_CONFIG_SLOT[0..2] exec.active_account::get_item
+    # => [t0_suffix, t0_prefix, t1_suffix, t1_prefix, token_index, amount]
+    movup.4
+    if.true
+        drop drop
+        # => [t1_suffix, t1_prefix, amount]
+    else
+        movup.2 drop movup.2 drop
+        # => [t0_suffix, t0_prefix, amount]
+    end
+    push.0
+    # => [enable_callbacks = 0, faucet_suffix, faucet_prefix, amount]
+    exec.asset::create_fungible_asset
+    # => [ASSET_KEY, ASSET_VALUE]
+end
+
+#! Classifies the note asset at asset_ptr as pool token 0 or 1 by kernel-side
+#! reconstruction; panics for foreign assets. The asset's value word is also
+#! checked against the canonical kernel-built one.
+#!
+#! Inputs:  [asset_ptr]
+#! Outputs: [token_index, amount]
+#!
+#! Panics if:
+#! - the asset's faucet matches neither pool token, or the value word is not
+#!   canonical, or the amount is zero.
+#!
+#! Invocation: exec
+@locals(4)
+proc classify_note_asset(asset_ptr: u32) -> (amount: felt, token_index: i1)
+    loc_store.CA_PTR
+    loc_load.CA_PTR add.4 mem_load
+    # => [amount]
+    dup loc_store.CA_AMOUNT
+    neq.0 assert.err=ERR_MINT_ZERO_ASSET
+    loc_load.CA_AMOUNT push.0
+    exec.make_pool_asset
+    # => [KEY0, VALUE0]
+    padw loc_load.CA_PTR mem_loadw_le
+    # => [NOTE_KEY, KEY0, VALUE0]
+    exec.eq_words
+    # => [is_token0, VALUE0]
+    if.true
+        padw loc_load.CA_PTR add.4 mem_loadw_le
+        assert_eqw.err=ERR_MINT_ASSET_VALUE_MISMATCH
+        push.0
+    else
+        dropw
+        loc_load.CA_AMOUNT push.1
+        exec.make_pool_asset
+        # => [KEY1, VALUE1]
+        padw loc_load.CA_PTR mem_loadw_le
+        assert_eqw.err=ERR_MINT_FOREIGN_ASSET
+        padw loc_load.CA_PTR add.4 mem_loadw_le
+        assert_eqw.err=ERR_MINT_ASSET_VALUE_MISMATCH
+        push.1
+    end
+    # => [token_index]
+    loc_load.CA_AMOUNT swap
+    # => [token_index, amount]
+end
+
+#! Emits one public P2ID note to the recipient carrying the given assets, which are
+#! removed from the account vault. The serial number derives deterministically from
+#! the active note's serial via Poseidon2(serial ‖ salt) — the same scheme as the
+#! Rust pool.
+#!
+#! Inputs:  [recipient_suffix, recipient_prefix, salt, assets_ptr, num_assets]
+#! Outputs: []
+#!
+#! Where:
+#! - assets_ptr is the memory address of num_assets consecutive (KEY, VALUE) pairs.
+#!
+#! Invocation: exec
+@locals(16)
+proc emit_p2id(recipient_suffix: felt, recipient_prefix: felt, salt: u32, assets_ptr: u32, num_assets: u32)
+    loc_store.EM_P2ID_STORAGE
+    loc_store.EM_P2ID_STORAGE_PREFIX
+    loc_store.EM_SALT_IN
+    loc_store.EM_ASSETS_PTR
+    loc_store.EM_NUM_ASSETS
+    # serial' = Poseidon2(input_serial ‖ salt) over a 5-felt preimage
+    exec.active_note::get_serial_number
+    loc_storew_le.EM_SERIAL dropw
+    loc_load.EM_SALT_IN loc_store.EM_SALT
+    push.5 locaddr.EM_SERIAL
+    exec.poseidon2::hash_elements
+    # => [SERIAL']
+    push.P2ID_ROOT_SLOT[0..2] exec.active_account::get_item
+    # => [SCRIPT_ROOT, SERIAL']
+    swapw
+    # => [SERIAL', SCRIPT_ROOT]
+    push.2 locaddr.EM_P2ID_STORAGE
+    exec.note::compute_and_store_recipient
+    # => [RECIPIENT]
+    push.NOTE_TYPE_PUBLIC push.P2ID_NOTE_TAG
+    exec.output_note::create
+    # => [note_idx]
+    loc_store.EM_NOTE_IDX
+    push.0
+    # => [i]
+    dup loc_load.EM_NUM_ASSETS neq
+    while.true
+        dup mul.8 loc_load.EM_ASSETS_PTR add
+        # => [addr, i]
+        padw dup.4 add.4 mem_loadw_le
+        padw dup.8 mem_loadw_le
+        # => [KEY, VALUE, addr, i]
+        exec.native_account::remove_asset
+        dropw
+        # => [addr, i]
+        loc_load.EM_NOTE_IDX
+        padw dup.5 add.4 mem_loadw_le
+        padw dup.9 mem_loadw_le
+        # => [KEY, VALUE, note_idx, addr, i]
+        exec.output_note::add_asset
+        # => [addr, i]
+        drop add.1
+        dup loc_load.EM_NUM_ASSETS neq
+    end
+    drop
+end

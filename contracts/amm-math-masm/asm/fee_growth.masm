@@ -1,0 +1,130 @@
+use amm::math::wide
+use miden::core::math::u128
+use miden::core::math::u256
+
+# Fee-growth accumulator helpers (Q128.128 in u256, DESIGN.md Part 3 item 4).
+#
+# Port of the fee-growth helpers in contracts/clamm-pool/src/lib.rs (the verified Rust
+# oracle): the increment floor((fee << 128) / L) as a Q128.128 u256, the truncating
+# fees-owed cast (L * delta) >> 128 mod 2^128 (Uniswap's uint128(mulDiv(...)) cast
+# semantics), and thin wrappers over the core library's wrapping u256 add/sub (Uniswap's
+# mod-2^256 accumulator arithmetic).
+#
+# u128 values are 4 little-endian u32 limbs, u256 values 8 little-endian u32 limbs,
+# limb 0 on top of the stack, matching the core-library layouts.
+
+# CONSTANTS
+# =================================================================================================
+
+# fee_shl128_div_liquidity memory locals
+const FGI_U_LOC = 0         # fee << 128, 8 limbs + spill (0..8)
+const FGI_U4_LOC = 4
+const FGI_U8_LOC = 8
+const FGI_L_LOC = 12        # liquidity (12..15)
+const FGI_Q_LOC = 16        # quotient, 8 limbs (16..23)
+const FGI_Q4_LOC = 20
+
+# liquidity_mul_delta_shr128 memory locals
+const FO_D_LOC = 0          # delta, 8 limbs (0..7)
+const FO_D4_LOC = 4
+const FO_L_LOC = 8          # liquidity (8..11)
+const FO_P_LOC = 12         # product, 12 limbs (12..23)
+const FO_P4_LOC = 16
+const FO_P5_LOC = 17
+const FO_P6_LOC = 18
+const FO_P7_LOC = 19
+
+# ERRORS
+# =================================================================================================
+
+const ERR_FEE_GROWTH_ZERO_LIQUIDITY = "fee_growth: fee growth with zero liquidity"
+
+# PROCEDURES
+# =================================================================================================
+
+#! Computes the fee-growth increment floor((fee << 128) / liquidity) as a Q128.128
+#! u256 (mirrors Uniswap's FullMath.mulDiv(fee, Q128, L)).
+#!
+#! Inputs:  [f0, f1, f2, f3, l0, l1, l2, l3]
+#! Outputs: [q0, q1, q2, q3, q4, q5, q6, q7]
+#!
+#! Where:
+#! - f0..f3 are the 32-bit limbs of the fee amount (f0 least significant).
+#! - l0..l3 are the 32-bit limbs of the active liquidity (l0 least significant).
+#! - q0..q7 are the 32-bit limbs of the Q128.128 increment (q0 least significant).
+#!
+#! Panics if:
+#! - liquidity is zero.
+#!
+#! Invocation: exec
+@locals(24)
+pub proc fee_shl128_div_liquidity(fee: u128, liquidity: u128) -> u256::u256
+    dupw.1 exec.u128::eqz assertz.err=ERR_FEE_GROWTH_ZERO_LIQUIDITY
+
+    # dividend = fee << 128
+    loc_storew_le.FGI_U4_LOC dropw
+    push.4 locaddr.FGI_U_LOC exec.wide::zero_limbs
+    push.0 locaddr.FGI_U8_LOC mem_store
+    loc_storew_le.FGI_L_LOC dropw
+
+    push.4 locaddr.FGI_L_LOC push.8 locaddr.FGI_U_LOC locaddr.FGI_Q_LOC
+    exec.wide::div_rem_ptr
+    drop
+
+    padw loc_loadw_le.FGI_Q4_LOC
+    padw loc_loadw_le.FGI_Q_LOC
+    # => [q0, q1, q2, q3, q4, q5, q6, q7]
+end
+
+#! Computes the fees owed truncating cast: ((liquidity * delta) >> 128) mod 2^128,
+#! exactly Uniswap's uint128(FullMath.mulDiv(delta, liquidity, Q128)) semantics.
+#!
+#! Inputs:  [d0, d1, d2, d3, d4, d5, d6, d7, l0, l1, l2, l3]
+#! Outputs: [o0, o1, o2, o3]
+#!
+#! Where:
+#! - d0..d7 are the 32-bit limbs of the Q128.128 fee-growth delta (d0 least significant).
+#! - l0..l3 are the 32-bit limbs of the position liquidity (l0 least significant).
+#! - o0..o3 are the 32-bit limbs of the owed amount (o0 least significant).
+#!
+#! Invocation: exec
+@locals(24)
+pub proc liquidity_mul_delta_shr128(delta: u256::u256, liquidity: u128) -> u128
+    loc_storew_le.FO_D_LOC dropw
+    loc_storew_le.FO_D4_LOC dropw
+    loc_storew_le.FO_L_LOC dropw
+
+    push.4 locaddr.FO_L_LOC push.8 locaddr.FO_D_LOC locaddr.FO_P_LOC
+    exec.wide::mul_limbs_ptr
+
+    loc_load.FO_P7_LOC loc_load.FO_P6_LOC loc_load.FO_P5_LOC loc_load.FO_P4_LOC
+    # => [o0, o1, o2, o3]  (product limbs 4..7 = bits 128..255, truncating)
+end
+
+#! Wrapping u256 addition (Uniswap fee-growth semantics: mod 2^256).
+#!
+#! Inputs:  [b0, b1, b2, b3, b4, b5, b6, b7, a0, a1, a2, a3, a4, a5, a6, a7]
+#! Outputs: [c0, c1, c2, c3, c4, c5, c6, c7]
+#!
+#! Where:
+#! - a0..a7, b0..b7 are the 32-bit limbs of the operands (limb 0 least significant).
+#! - c0..c7 are the 32-bit limbs of (a + b) mod 2^256.
+#!
+#! Invocation: exec
+pub proc u256_wrapping_add(b: u256::u256, a: u256::u256) -> u256::u256
+    exec.u256::wrapping_add
+end
+
+#! Wrapping u256 subtraction (mod 2^256).
+#!
+#! Inputs:  [b0, b1, b2, b3, b4, b5, b6, b7, a0, a1, a2, a3, a4, a5, a6, a7]
+#! Outputs: [c0, c1, c2, c3, c4, c5, c6, c7]
+#!
+#! Where:
+#! - a0..a7, b0..b7 are the 32-bit limbs of the operands (limb 0 least significant).
+#! - c0..c7 are the 32-bit limbs of (a - b) mod 2^256.
+#!
+#! Invocation: exec
+pub proc u256_wrapping_sub(b: u256::u256, a: u256::u256) -> u256::u256
+    exec.u256::wrapping_sub
+end

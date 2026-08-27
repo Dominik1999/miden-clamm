@@ -1,0 +1,17 @@
+[package]
+name = "probe-note"
+version = "0.1.0"
+
+[lib]
+kind = "note"
+# Notes export a package-derived interface (`miden-<package>`), matching the `#[note]` macro.
+namespace = "miden:probe-note/miden-probe-note@0.1.0"
+
+[dependencies]
+miden-core = "*"
+miden-protocol = "*"
+sender-probe = { path = "../sender-probe" }
+
+# WIT for the account component this note calls, produced by building sender-probe.
+[package.metadata.miden.dependencies]
+sender-probe = { wit = "../sender-probe/target/generated-wit/" }

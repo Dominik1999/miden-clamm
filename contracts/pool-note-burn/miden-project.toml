@@ -1,0 +1,17 @@
+[package]
+name = "pool-note-burn"
+version = "0.1.0"
+
+[lib]
+kind = "note"
+# Notes export a package-derived interface (miden-<package>), matching the #[note] macro.
+namespace = "miden:pool-note-burn/miden-pool-note-burn@0.1.0"
+
+[dependencies]
+miden-core = "*"
+miden-protocol = "*"
+clamm-pool = { path = "../clamm-pool" }
+
+# WIT for the pool component this note calls, produced by building clamm-pool.
+[package.metadata.miden.dependencies]
+clamm-pool = { wit = "../clamm-pool/target/generated-wit/" }

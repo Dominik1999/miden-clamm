@@ -1,0 +1,11 @@
+target/
+node_modules/
+dist/
+local-net/bin/
+local-net/logs/
+local-net/run/
+local-net/genesis/
+local-node-data/
+frontend/.env.local
+frontend/public/packages/clamm/deployment.json
+.DS_Store

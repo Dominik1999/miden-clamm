@@ -1,0 +1,871 @@
+use miden::core::math::u64
+use miden::core::math::u128
+
+# Wide unsigned-integer arithmetic over little-endian u32 limb arrays in memory.
+#
+# This module underpins every other module in the amm::math library. It mirrors the
+# Rust reference implementation in contracts/amm-math/src/wide.rs (the verified oracle):
+# schoolbook multiplication produces exact wide products, and a Knuth Algorithm D long
+# division handles wide dividends (up to 352-bit numerators over up to 257-bit divisors).
+# Quotient digits are estimated with the advice-backed core-library divisions
+# (miden::core::math::u64::divmod), whose event handlers every transaction host
+# registers, so the routines work in every execution context including network
+# transactions.
+#
+# Conventions:
+# - A limb array is a sequence of u32 values, one per memory address, least significant
+#   limb first (little-endian).
+# - All limbs are assumed to be valid u32 values; this is not re-checked on every
+#   operation (matching the core library's u64/u128 modules). Advice-derived limbs are
+#   asserted by the core-library divmod procedures themselves.
+# - Pointers are absolute element addresses (callers pass `locaddr` of their locals).
+
+# CONSTANTS
+# =================================================================================================
+
+# add_prop memory locals
+const ADD_PROP_DST_LOC = 0
+const ADD_PROP_DST_LEN_LOC = 1
+const ADD_PROP_SRC_LOC = 2
+const ADD_PROP_SRC_LEN_LOC = 3
+
+# sub_limbs_ptr memory locals
+const SUB_DST_LOC = 0
+const SUB_SRC_LOC = 1
+const SUB_LEN_LOC = 2
+
+# cmp_limbs memory locals
+const CMP_A_LOC = 0
+const CMP_B_LOC = 1
+
+# mul_limbs_ptr memory locals
+const MUL_OUT_LOC = 0
+const MUL_A_LOC = 1
+const MUL_A_LEN_LOC = 2
+const MUL_B_LOC = 3
+const MUL_B_LEN_LOC = 4
+const MUL_AI_LOC = 5
+
+# normalize_limbs memory locals
+const NORM_P2S_LOC = 0
+
+# div_rem_ptr memory locals
+const DIV_Q_LOC = 0
+const DIV_U_LOC = 1
+const DIV_U_LEN_LOC = 2
+const DIV_V_LOC = 3
+const DIV_V_LEN_LOC = 4
+const DIV_VSIG_LOC = 5
+const DIV_USIG_LOC = 6
+
+# div_rem_short memory locals
+const SHORT_Q_LOC = 0
+const SHORT_U_LOC = 1
+const SHORT_D_LOC = 2
+
+# div_rem_knuth memory locals
+const KNUTH_Q_LOC = 0
+const KNUTH_U_LOC = 1
+const KNUTH_USIG_LOC = 2
+const KNUTH_V_LOC = 3
+const KNUTH_VSIG_LOC = 4
+const KNUTH_P2S_LOC = 5
+const KNUTH_VTOP_LOC = 6
+const KNUTH_VNEXT_LOC = 7
+const KNUTH_QHAT_LOC = 8
+const KNUTH_RHAT_LOC = 9
+const KNUTH_BASE_LOC = 10
+
+# div_round_ptr memory locals
+const DIVR_Q_LOC = 0
+const DIVR_U_LEN_LOC = 1
+
+# ERRORS
+# =================================================================================================
+
+const ERR_WIDE_DIVISION_BY_ZERO = "wide: division by zero"
+const ERR_WIDE_ADDITION_OVERFLOW = "wide: addition overflow"
+const ERR_WIDE_SUBTRACTION_UNDERFLOW = "wide: subtraction underflow"
+const ERR_WIDE_INCREMENT_OVERFLOW = "wide: increment overflow"
+const ERR_WIDE_NORMALIZATION_CARRY = "wide: internal error: normalization carry must be zero"
+
+# PROCEDURES
+# =================================================================================================
+
+#! Returns the number of significant limbs of a little-endian u32 limb array.
+#!
+#! Inputs:  [ptr, len]
+#! Outputs: [sig]
+#!
+#! Where:
+#! - ptr is the memory address of the array's least significant limb.
+#! - len is the number of limbs in the array.
+#! - sig is the index of the highest non-zero limb plus one (0 when all limbs are zero).
+#!
+#! Invocation: exec
+pub proc sig_limbs(arr_ptr: u32, len: u32) -> u32
+    swap
+    # => [i, ptr]
+
+    # scan down from the top while the current top limb is zero
+    dup neq.0
+    if.true
+        dup.1 dup.1 add sub.1 mem_load eq.0
+    else
+        push.0
+    end
+    while.true
+        sub.1
+        dup neq.0
+        if.true
+            dup.1 dup.1 add sub.1 mem_load eq.0
+        else
+            push.0
+        end
+    end
+    swap drop
+    # => [sig]
+end
+
+#! Writes zeros to a range of memory limbs.
+#!
+#! Inputs:  [ptr, len]
+#! Outputs: []
+#!
+#! Where:
+#! - ptr is the memory address of the first limb to clear.
+#! - len is the number of limbs to clear.
+#!
+#! Invocation: exec
+pub proc zero_limbs(arr_ptr: u32, len: u32)
+    dup.1 dup.1 add swap movup.2 drop
+    # => [ptr, end]
+
+    dup.1 dup.1 neq
+    while.true
+        dup push.0 swap mem_store
+        add.1
+        dup.1 dup.1 neq
+    end
+    drop drop
+end
+
+#! Copies a range of memory limbs. The ranges must not overlap.
+#!
+#! Inputs:  [dst_ptr, src_ptr, len]
+#! Outputs: []
+#!
+#! Where:
+#! - dst_ptr is the memory address of the destination's least significant limb.
+#! - src_ptr is the memory address of the source's least significant limb.
+#! - len is the number of limbs to copy.
+#!
+#! Invocation: exec
+pub proc copy_limbs(dst_ptr: u32, src_ptr: u32, len: u32)
+    dup.2 neq.0
+    while.true
+        dup.1 mem_load
+        # => [value, dst_ptr, src_ptr, len]
+
+        dup.1 mem_store
+        # => [dst_ptr, src_ptr, len]
+
+        add.1 swap add.1 swap
+        movup.2 sub.1 movdn.2
+        dup.2 neq.0
+    end
+    drop drop drop
+end
+
+#! Adds a limb array into another in place: dst += src, mod nothing (carry must not
+#! overflow the destination width).
+#!
+#! Inputs:  [dst_ptr, dst_len, src_ptr, src_len]
+#! Outputs: []
+#!
+#! Where:
+#! - dst_ptr is the memory address of the destination array (dst_len limbs, updated in place).
+#! - src_ptr is the memory address of the source array (src_len limbs, src_len <= dst_len).
+#!
+#! Panics if:
+#! - the addition carries out of the destination's dst_len limbs.
+#!
+#! Invocation: exec
+@locals(4)
+pub proc add_prop(dst_ptr: u32, dst_len: u32, src_ptr: u32, src_len: u32)
+    loc_store.ADD_PROP_DST_LOC
+    loc_store.ADD_PROP_DST_LEN_LOC
+    loc_store.ADD_PROP_SRC_LOC
+    loc_store.ADD_PROP_SRC_LEN_LOC
+    push.0 push.0
+    # => [i, carry]
+
+    dup loc_load.ADD_PROP_DST_LEN_LOC neq
+    while.true
+        # t = dst[i] + carry (+ src[i] when i < src_len)
+        dup loc_load.ADD_PROP_DST_LOC add mem_load
+        movup.2 add
+        # => [t, i]
+
+        dup.1 loc_load.ADD_PROP_SRC_LEN_LOC u32lt
+        if.true
+            dup.1 loc_load.ADD_PROP_SRC_LOC add mem_load add
+        end
+        # => [t, i]
+
+        u32split
+        # => [lo, hi, i]
+
+        dup.2 loc_load.ADD_PROP_DST_LOC add mem_store
+        # => [carry, i]
+
+        swap add.1
+        dup loc_load.ADD_PROP_DST_LEN_LOC neq
+    end
+    # => [i, carry]
+
+    drop assertz.err=ERR_WIDE_ADDITION_OVERFLOW
+end
+
+#! Subtracts a limb array from another in place: dst -= src.
+#!
+#! Inputs:  [dst_ptr, src_ptr, len]
+#! Outputs: []
+#!
+#! Where:
+#! - dst_ptr is the memory address of the destination array (len limbs, updated in place).
+#! - src_ptr is the memory address of the source array (len limbs).
+#!
+#! Panics if:
+#! - the subtraction underflows (dst < src).
+#!
+#! Invocation: exec
+@locals(4)
+pub proc sub_limbs_ptr(dst_ptr: u32, src_ptr: u32, len: u32)
+    loc_store.SUB_DST_LOC
+    loc_store.SUB_SRC_LOC
+    loc_store.SUB_LEN_LOC
+    push.0 push.0
+    # => [i, borrow]
+
+    dup loc_load.SUB_LEN_LOC neq
+    while.true
+        dup loc_load.SUB_DST_LOC add
+        # => [addr, i, borrow]
+
+        dup mem_load
+        dup.2 loc_load.SUB_SRC_LOC add mem_load
+        # => [src_i, dst_i, addr, i, borrow]
+
+        u32overflowing_sub
+        # => [b1, d1, addr, i, borrow]
+
+        swap movup.4
+        u32overflowing_sub
+        # => [b2, d2, b1, addr, i]
+
+        movup.2 add
+        movdn.3
+        # => [d2, addr, i, borrow']
+
+        swap mem_store
+        # => [i, borrow']
+
+        add.1
+        dup loc_load.SUB_LEN_LOC neq
+    end
+    # => [i, borrow]
+
+    drop assertz.err=ERR_WIDE_SUBTRACTION_UNDERFLOW
+end
+
+#! Increments a limb array in place: x += 1.
+#!
+#! Inputs:  [ptr, len]
+#! Outputs: []
+#!
+#! Where:
+#! - ptr is the memory address of the array's least significant limb.
+#! - len is the number of limbs in the array.
+#!
+#! Panics if:
+#! - the increment carries out of the array's len limbs.
+#!
+#! Invocation: exec
+pub proc inc_limbs(arr_ptr: u32, len: u32)
+    push.1
+    # => [carry, ptr, len]
+
+    # loop while carry != 0 and limbs remain
+    dup neq.0 dup.3 neq.0 and
+    while.true
+        dup.1 mem_load add
+        # => [t, ptr, len]
+
+        u32split
+        # => [lo, carry', ptr, len]
+
+        dup.2 mem_store
+        # => [carry', ptr, len]
+
+        swap add.1 swap
+        movup.2 sub.1 movdn.2
+        dup neq.0 dup.3 neq.0 and
+    end
+    # => [carry, ptr, len]
+
+    assertz.err=ERR_WIDE_INCREMENT_OVERFLOW
+    drop drop
+end
+
+#! Numerically compares two equal-length limb arrays.
+#!
+#! Inputs:  [a_ptr, b_ptr, len]
+#! Outputs: [ord]
+#!
+#! Where:
+#! - a_ptr is the memory address of the left operand (len limbs).
+#! - b_ptr is the memory address of the right operand (len limbs).
+#! - ord is 0 when a < b, 1 when a == b, 2 when a > b.
+#!
+#! Invocation: exec
+@locals(2)
+pub proc cmp_limbs(a_ptr: u32, b_ptr: u32, len: u32) -> u32
+    loc_store.CMP_A_LOC
+    loc_store.CMP_B_LOC
+    # => [i]  (i = len)
+
+    push.1 swap
+    # => [i, ord]  (ord = 1 means undecided-equal)
+
+    # scan from the most significant limb down until a difference decides the order
+    dup neq.0 dup.2 eq.1 and
+    while.true
+        sub.1
+        dup loc_load.CMP_A_LOC add mem_load
+        dup.1 loc_load.CMP_B_LOC add mem_load
+        # => [b_i, a_i, i, ord]
+
+        dup.1 dup.1 neq
+        if.true
+            u32gt mul.2
+            # => [ord', i, ord]
+
+            movup.2 drop swap
+            # => [i, ord']
+        else
+            drop drop
+        end
+        # => [i, ord]
+
+        dup neq.0 dup.2 eq.1 and
+    end
+    drop
+    # => [ord]
+end
+
+#! Schoolbook multiplication of two limb arrays: out = a * b.
+#!
+#! The output range must hold a_len + b_len limbs and must not overlap the inputs; it is
+#! fully overwritten. Mirrors wide::mul_limbs in the Rust oracle (zero rows are skipped;
+#! the result is identical either way).
+#!
+#! Inputs:  [out_ptr, a_ptr, a_len, b_ptr, b_len]
+#! Outputs: []
+#!
+#! Where:
+#! - out_ptr is the memory address of the product array (a_len + b_len limbs).
+#! - a_ptr is the memory address of the left factor (a_len limbs).
+#! - b_ptr is the memory address of the right factor (b_len limbs).
+#!
+#! Invocation: exec
+@locals(8)
+pub proc mul_limbs_ptr(out_ptr: u32, a_ptr: u32, a_len: u32, b_ptr: u32, b_len: u32)
+    loc_store.MUL_OUT_LOC
+    loc_store.MUL_A_LOC
+    loc_store.MUL_A_LEN_LOC
+    loc_store.MUL_B_LOC
+    loc_store.MUL_B_LEN_LOC
+
+    loc_load.MUL_A_LEN_LOC loc_load.MUL_B_LEN_LOC add loc_load.MUL_OUT_LOC
+    exec.zero_limbs
+
+    push.0
+    # => [i]
+
+    dup loc_load.MUL_A_LEN_LOC neq
+    while.true
+        dup loc_load.MUL_A_LOC add mem_load
+        # => [a_i, i]
+
+        dup neq.0
+        if.true
+            loc_store.MUL_AI_LOC
+            push.0 push.0
+            # => [j, carry, i]
+
+            dup loc_load.MUL_B_LEN_LOC neq
+            while.true
+                swap
+                # => [carry, j, i]
+
+                dup.1 loc_load.MUL_B_LOC add mem_load
+                loc_load.MUL_AI_LOC
+                u32widening_madd
+                # => [lo1, hi1, j, i]  (a_i * b_j + carry)
+
+                dup.2 dup.4 add loc_load.MUL_OUT_LOC add
+                # => [out_addr, lo1, hi1, j, i]
+
+                dup mem_load
+                # => [out_v, out_addr, lo1, hi1, j, i]
+
+                movup.2 u32widening_add
+                # => [sum, c2, out_addr, hi1, j, i]
+
+                swap movup.3 add
+                # => [carry', sum, out_addr, j, i]
+
+                movdn.2 swap mem_store
+                # => [carry', j, i]
+
+                swap add.1
+                dup loc_load.MUL_B_LEN_LOC neq
+            end
+            # => [j, carry, i]
+
+            drop
+            dup.1 loc_load.MUL_B_LEN_LOC add loc_load.MUL_OUT_LOC add mem_store
+            # => [i]  (out[i + b_len] = carry)
+        else
+            drop
+        end
+        add.1
+        dup loc_load.MUL_A_LEN_LOC neq
+    end
+    drop
+end
+
+#! Divides two limb arrays, computing the quotient and a remainder-nonzero flag.
+#!
+#! Divisors of one significant limb use short division; wider divisors use Knuth's
+#! Algorithm D with u32 digits (normalization, two-limb qhat estimation with correction,
+#! and the add-back branch). Every quotient-digit estimate goes through the advice-backed
+#! miden::core::math::u64::divmod, which verifies the advice in-circuit, so no unproven
+#! value enters the computation. Quotient and remainder are unique for Euclidean
+#! division, so results are bit-identical to the Rust oracle's wide::div_rem.
+#!
+#! Both input buffers are destroyed: u is normalized in place and ends up holding the
+#! normalized remainder in its low limbs, and v is normalized in place.
+#!
+#! Inputs:  [q_ptr, u_ptr, u_len, v_ptr, v_len]
+#! Outputs: [rem_nonzero]
+#!
+#! Where:
+#! - q_ptr is the memory address of the quotient buffer (u_len limbs; fully written,
+#!   zero above the quotient digits).
+#! - u_ptr is the memory address of the dividend (u_len limbs; the buffer must have
+#!   u_len + 1 limbs of writable space for the normalization spill limb; destroyed).
+#! - v_ptr is the memory address of the divisor (v_len limbs; destroyed).
+#! - rem_nonzero is 1 when the division remainder is non-zero, 0 otherwise.
+#!
+#! Panics if:
+#! - the divisor is zero.
+#!
+#! Invocation: exec
+@locals(8)
+pub proc div_rem_ptr(q_ptr: u32, u_ptr: u32, u_len: u32, v_ptr: u32, v_len: u32) -> i1
+    loc_store.DIV_Q_LOC
+    loc_store.DIV_U_LOC
+    loc_store.DIV_U_LEN_LOC
+    loc_store.DIV_V_LOC
+    loc_store.DIV_V_LEN_LOC
+
+    # zero the full quotient buffer up front
+    loc_load.DIV_U_LEN_LOC loc_load.DIV_Q_LOC exec.zero_limbs
+
+    # significant limb counts
+    loc_load.DIV_V_LEN_LOC loc_load.DIV_V_LOC exec.sig_limbs
+    dup loc_store.DIV_VSIG_LOC
+    neq.0 assert.err=ERR_WIDE_DIVISION_BY_ZERO
+    loc_load.DIV_U_LEN_LOC loc_load.DIV_U_LOC exec.sig_limbs loc_store.DIV_USIG_LOC
+
+    # dividend narrower than divisor: q = 0, remainder = u
+    loc_load.DIV_USIG_LOC loc_load.DIV_VSIG_LOC u32lt
+    if.true
+        loc_load.DIV_USIG_LOC neq.0
+    else
+        loc_load.DIV_VSIG_LOC eq.1
+        if.true
+            loc_load.DIV_V_LOC mem_load
+            loc_load.DIV_USIG_LOC
+            loc_load.DIV_U_LOC
+            loc_load.DIV_Q_LOC
+            exec.div_rem_short
+        else
+            loc_load.DIV_VSIG_LOC
+            loc_load.DIV_V_LOC
+            loc_load.DIV_USIG_LOC
+            loc_load.DIV_U_LOC
+            loc_load.DIV_Q_LOC
+            exec.div_rem_knuth
+        end
+    end
+end
+
+#! Divides two limb arrays, rounding the quotient up when requested and the remainder
+#! is non-zero. Same buffer contract as div_rem_ptr.
+#!
+#! Inputs:  [q_ptr, u_ptr, u_len, v_ptr, v_len, round_up]
+#! Outputs: []
+#!
+#! Where:
+#! - q_ptr, u_ptr, u_len, v_ptr, v_len are as in div_rem_ptr.
+#! - round_up is 1 to round the quotient up on a non-zero remainder, 0 to truncate.
+#!
+#! Panics if:
+#! - the divisor is zero.
+#! - rounding up carries out of the quotient's u_len limbs.
+#!
+#! Invocation: exec
+@locals(2)
+pub proc div_round_ptr(q_ptr: u32, u_ptr: u32, u_len: u32, v_ptr: u32, v_len: u32, round_up: i1)
+    dup loc_store.DIVR_Q_LOC
+    dup.2 loc_store.DIVR_U_LEN_LOC
+    exec.div_rem_ptr
+    # => [rem_nonzero, round_up]
+
+    and
+    if.true
+        loc_load.DIVR_U_LEN_LOC loc_load.DIVR_Q_LOC exec.inc_limbs
+    end
+end
+
+# HELPER PROCEDURES
+# =================================================================================================
+
+#! Shifts a limb array left in place by s bits (s < 32), returning the carry limb.
+#!
+#! Inputs:  [ptr, len, p2s]
+#! Outputs: [carry]
+#!
+#! Where:
+#! - ptr is the memory address of the array (len limbs, updated in place).
+#! - p2s is 2^s, the power of two to multiply by.
+#! - carry is the bits shifted out of the top limb.
+#!
+#! Invocation: exec
+@locals(1)
+proc normalize_limbs(arr_ptr: u32, len: u32, p2s: u32) -> u32
+    movup.2 loc_store.NORM_P2S_LOC
+    dup.1 dup.1 add swap movup.2 drop
+    # => [ptr, end]
+
+    push.0 movdn.2
+    # => [ptr, end, carry]
+
+    dup.1 dup.1 neq
+    while.true
+        dup mem_load loc_load.NORM_P2S_LOC mul
+        movup.3 add
+        # => [t, ptr, end]
+
+        u32split
+        # => [lo, carry', ptr, end]
+
+        dup.2 mem_store
+        # => [carry', ptr, end]
+
+        movdn.2 add.1
+        dup.1 dup.1 neq
+    end
+    # => [ptr, end, carry]
+
+    drop drop
+    # => [carry]
+end
+
+#! Short division of a limb array by a single non-zero u32 limb.
+#!
+#! Each digit step runs the advice-backed u64 divmod; the advice is verified in-circuit
+#! by the core library.
+#!
+#! Inputs:  [q_ptr, u_ptr, usig, d]
+#! Outputs: [rem_nonzero]
+#!
+#! Where:
+#! - q_ptr is the memory address of the quotient buffer (digits 0..usig written; the
+#!   dispatcher has already zeroed the buffer above).
+#! - u_ptr is the memory address of the dividend (usig significant limbs; not modified).
+#! - d is the single-limb divisor (non-zero).
+#! - rem_nonzero is 1 when the division remainder is non-zero.
+#!
+#! Invocation: exec
+@locals(4)
+proc div_rem_short(q_ptr: u32, u_ptr: u32, usig: u32, d: u32) -> i1
+    loc_store.SHORT_Q_LOC
+    loc_store.SHORT_U_LOC
+    swap loc_store.SHORT_D_LOC
+    # => [i]  (i = usig)
+
+    push.0 swap
+    # => [i, rem]
+
+    dup neq.0
+    while.true
+        sub.1
+        dup loc_load.SHORT_U_LOC add mem_load
+        # => [u_i, i, rem]
+
+        movup.2 swap
+        # => [u_i, rem, i]
+
+        push.0 loc_load.SHORT_D_LOC
+        # => [d, 0, u_i, rem, i]  (dividend = rem * 2^32 + u_i)
+
+        exec.u64::divmod
+        # => [r_lo, r_hi, q_lo, q_hi, i]
+
+        swap drop movup.2 drop
+        # => [r_lo, q_lo, i]  (r_hi and q_hi are provably zero)
+
+        swap dup.2 loc_load.SHORT_Q_LOC add mem_store
+        # => [rem, i]  (q[i] = q_lo)
+
+        swap
+        dup neq.0
+    end
+    # => [i, rem]
+
+    drop neq.0
+    # => [rem_nonzero]
+end
+
+#! Knuth Algorithm D long division with u32 digits, for divisors of two or more
+#! significant limbs. Both buffers are normalized (destroyed) in place.
+#!
+#! Inputs:  [q_ptr, u_ptr, usig, v_ptr, vsig]
+#! Outputs: [rem_nonzero]
+#!
+#! Where:
+#! - q_ptr is the memory address of the quotient buffer (digits 0..usig-vsig+1 written;
+#!   the dispatcher has already zeroed the buffer above).
+#! - u_ptr is the memory address of the dividend (usig significant limbs, plus one
+#!   writable spill limb; destroyed).
+#! - v_ptr is the memory address of the divisor (vsig >= 2 significant limbs; destroyed).
+#! - rem_nonzero is 1 when the division remainder is non-zero.
+#!
+#! Invocation: exec
+@locals(12)
+proc div_rem_knuth(q_ptr: u32, u_ptr: u32, usig: u32, v_ptr: u32, vsig: u32) -> i1
+    loc_store.KNUTH_Q_LOC
+    loc_store.KNUTH_U_LOC
+    loc_store.KNUTH_USIG_LOC
+    loc_store.KNUTH_V_LOC
+    loc_store.KNUTH_VSIG_LOC
+
+    # normalization multiplier 2^s with s = clz(v[vsig-1])
+    loc_load.KNUTH_VSIG_LOC loc_load.KNUTH_V_LOC add sub.1 mem_load u32clz pow2
+    loc_store.KNUTH_P2S_LOC
+
+    # normalize v in place (carry out must be zero by choice of s)
+    loc_load.KNUTH_P2S_LOC loc_load.KNUTH_VSIG_LOC loc_load.KNUTH_V_LOC
+    exec.normalize_limbs
+    assertz.err=ERR_WIDE_NORMALIZATION_CARRY
+
+    # normalize u in place, spilling the carry into u[usig]
+    loc_load.KNUTH_P2S_LOC loc_load.KNUTH_USIG_LOC loc_load.KNUTH_U_LOC
+    exec.normalize_limbs
+    loc_load.KNUTH_USIG_LOC loc_load.KNUTH_U_LOC add mem_store
+    # => []  (u[usig] = carry)
+
+    # cache the two top divisor limbs
+    loc_load.KNUTH_VSIG_LOC loc_load.KNUTH_V_LOC add
+    dup sub.1 mem_load loc_store.KNUTH_VTOP_LOC
+    sub.2 mem_load loc_store.KNUTH_VNEXT_LOC
+
+    # digit loop: j = usig - vsig down to 0
+    loc_load.KNUTH_USIG_LOC loc_load.KNUTH_VSIG_LOC sub add.1
+    # => [c]  (c = j + 1)
+
+    dup neq.0
+    while.true
+        sub.1
+        # => [j]
+
+        dup loc_load.KNUTH_U_LOC add loc_store.KNUTH_BASE_LOC
+
+        # ---- qhat estimate: (u[base+vsig] * 2^32 + u[base+vsig-1]) / vtop ----
+        loc_load.KNUTH_VSIG_LOC loc_load.KNUTH_BASE_LOC add
+        dup mem_load
+        swap sub.1 mem_load
+        # => [un_next, un_top, j]
+
+        push.0 loc_load.KNUTH_VTOP_LOC
+        exec.u64::divmod
+        # => [r_lo, r_hi, q_lo, q_hi, j]
+
+        swap drop loc_store.KNUTH_RHAT_LOC
+        # => [q_lo, q_hi, j]  (rhat = r_lo; r_hi is provably zero)
+
+        # ---- qhat correction: while qhat >= 2^32 or qhat * vnext > rhat * 2^32 + u[base+vsig-2] ----
+        dup.1 dup.1
+        push.0 loc_load.KNUTH_VNEXT_LOC
+        exec.u64::widening_mul
+        # => [p0, p1, p2, p3, q_lo, q_hi, j]
+
+        push.0 push.0
+        loc_load.KNUTH_RHAT_LOC
+        loc_load.KNUTH_VSIG_LOC loc_load.KNUTH_BASE_LOC add sub.2 mem_load
+        exec.u128::gt
+        # => [prod_gt_rhs, q_lo, q_hi, j]
+
+        dup.2 neq.0 or
+        while.true
+            # qhat -= 1
+            push.0 push.1 exec.u64::wrapping_sub
+            # => [q_lo, q_hi, j]
+
+            # rhat += vtop; stop when rhat reaches 2^32
+            loc_load.KNUTH_RHAT_LOC loc_load.KNUTH_VTOP_LOC add
+            dup u32split drop neq.0
+            # => [rhat_overflow, rhat', q_lo, q_hi, j]
+
+            if.true
+                drop push.0
+            else
+                loc_store.KNUTH_RHAT_LOC
+                dup.1 dup.1
+                push.0 loc_load.KNUTH_VNEXT_LOC
+                exec.u64::widening_mul
+                push.0 push.0
+                loc_load.KNUTH_RHAT_LOC
+                loc_load.KNUTH_VSIG_LOC loc_load.KNUTH_BASE_LOC add sub.2 mem_load
+                exec.u128::gt
+                dup.2 neq.0 or
+            end
+        end
+        # => [q_lo, q_hi, j]
+
+        swap drop loc_store.KNUTH_QHAT_LOC
+        # => [j]  (digit truncated to u32, mirroring the oracle's `qhat as u64` cast)
+
+        # ---- multiply-and-subtract: u[base .. base+vsig] -= qhat * v ----
+        push.0 push.0 push.0
+        # => [i, mc, bw, j]
+
+        dup loc_load.KNUTH_VSIG_LOC neq
+        while.true
+            dup loc_load.KNUTH_V_LOC add mem_load
+            # => [v_i, i, mc, bw, j]
+
+            movup.2 swap loc_load.KNUTH_QHAT_LOC
+            u32widening_madd
+            # => [p_lo, p_hi, i, bw, j]  (qhat * v_i + mc)
+
+            swap movdn.4
+            # => [p_lo, i, bw, j, mc']
+
+            dup.1 loc_load.KNUTH_BASE_LOC add
+            # => [addr, p_lo, i, bw, j, mc']
+
+            dup mem_load
+            # => [un_v, addr, p_lo, i, bw, j, mc']
+
+            movup.2 u32overflowing_sub
+            # => [b1, d1, addr, i, bw, j, mc']
+
+            swap movup.4 u32overflowing_sub
+            # => [b2, d2, b1, addr, i, j, mc']
+
+            movup.2 add
+            # => [bw', d2, addr, i, j, mc']
+
+            movdn.5
+            # => [d2, addr, i, j, mc', bw']
+
+            swap mem_store
+            # => [i, j, mc', bw']
+
+            swap movdn.3
+            # => [i, mc', bw', j]
+
+            add.1
+            dup loc_load.KNUTH_VSIG_LOC neq
+        end
+        # => [i, mc, bw, j]
+
+        drop
+        # => [mc, bw, j]
+
+        # top limb: u[base+vsig] -= mc + bw
+        loc_load.KNUTH_VSIG_LOC loc_load.KNUTH_BASE_LOC add
+        # => [addr, mc, bw, j]
+
+        dup mem_load
+        # => [un_v, addr, mc, bw, j]
+
+        movup.2 u32overflowing_sub
+        # => [b1, d1, addr, bw, j]
+
+        swap movup.3 u32overflowing_sub
+        # => [b2, d2, b1, addr, j]
+
+        movup.2 add
+        # => [fb, d2, addr, j]
+
+        movdn.2 swap mem_store
+        # => [fb, j]
+
+        # q[j] = qhat
+        dup.1 loc_load.KNUTH_Q_LOC add loc_load.KNUTH_QHAT_LOC swap mem_store
+        # => [fb, j]
+
+        # ---- add-back branch (qhat was one too large) ----
+        if.true
+            dup loc_load.KNUTH_Q_LOC add
+            dup mem_load sub.1 swap mem_store
+            # => [j]  (q[j] -= 1)
+
+            push.0 push.0
+            # => [i, carry, j]
+
+            dup loc_load.KNUTH_VSIG_LOC neq
+            while.true
+                dup loc_load.KNUTH_BASE_LOC add
+                # => [addr, i, carry, j]
+
+                dup mem_load
+                dup.2 loc_load.KNUTH_V_LOC add mem_load
+                add movup.3 add
+                # => [t, addr, i, j]
+
+                u32split
+                # => [lo, carry', addr, i, j]
+
+                movup.2 mem_store
+                # => [carry', i, j]
+
+                swap add.1
+                dup loc_load.KNUTH_VSIG_LOC neq
+            end
+            # => [i, carry, j]
+
+            drop
+            loc_load.KNUTH_VSIG_LOC loc_load.KNUTH_BASE_LOC add
+            dup mem_load
+            # => [un_v, addr, carry, j]
+
+            movup.2 add u32split swap drop
+            # => [lo, addr, j]  (u[base+vsig] += carry, wrapping)
+
+            swap mem_store
+            # => [j]
+        end
+        dup neq.0
+    end
+    drop
+
+    # remainder-nonzero flag over the normalized remainder u[0 .. vsig)
+    loc_load.KNUTH_VSIG_LOC loc_load.KNUTH_U_LOC exec.sig_limbs neq.0
+end

@@ -1,0 +1,27 @@
+.card {
+  padding: 2em;
+}
+
+.counter-button {
+  font-size: 1.2em;
+  padding: 0.8em 1.6em;
+}
+
+.account-id {
+  font-size: 0.8em;
+  color: #888;
+  font-family: monospace;
+  margin-top: 0.5rem;
+  text-decoration: none;
+}
+
+.account-id:hover {
+  text-decoration: underline;
+}
+
+.error {
+  color: #ff4444;
+  font-size: 0.9em;
+  margin-top: 0.5rem;
+  word-break: break-word;
+}

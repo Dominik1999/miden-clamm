@@ -1,0 +1,25 @@
+[package]
+name = "clamm-pool-masm"
+version = "0.1.0"
+edition = "2021"
+description = "Hand-written MASM port of the clamm-pool account component and its four production note scripts"
+
+[dependencies]
+amm-math-masm = { path = "../amm-math-masm" }
+miden-assembly = "0.23"
+miden-protocol = "0.15"
+miden-standards = "0.15"
+
+[dev-dependencies]
+amm-math = { path = "../amm-math" }
+miden-processor = "0.23"
+
+# This crate is its own workspace root (contracts/ crates are excluded from the
+# project workspace); keep dependencies optimized even in dev builds.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[workspace]

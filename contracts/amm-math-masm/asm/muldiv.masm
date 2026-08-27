@@ -1,0 +1,124 @@
+use amm::math::wide
+use miden::core::math::u128
+
+# `a * b / d` over u128 with an exact 256-bit intermediate product.
+#
+# Port of contracts/amm-math/src/muldiv.rs (the verified Rust oracle), which is the
+# equivalent of Uniswap v3's FullMath.mulDiv / mulDivRoundingUp. The 256-bit product is
+# computed by schoolbook limb multiplication and divided by the Knuth-D limb division in
+# amm::math::wide, whose quotient-digit steps use the advice-backed core-library
+# divisions (functional in every execution context, including network transactions).
+#
+# u128 values are 4 little-endian u32 limbs, limb 0 on top of the stack, matching the
+# miden::core::math::u128 layout.
+
+# CONSTANTS
+# =================================================================================================
+
+# mul_div_floor / mul_div_ceil memory locals (little-endian u32 limb arrays)
+const MULDIV_U_LOC = 0      # 256-bit product, 8 limbs + normalization spill (0..8)
+const MULDIV_A_LOC = 12     # multiplicand a (12..15)
+const MULDIV_B_LOC = 16     # multiplicand b (16..19)
+const MULDIV_D_LOC = 20     # divisor d (20..23)
+const MULDIV_Q_LOC = 24     # quotient, 8 limbs (24..31)
+const MULDIV_Q_HI_LOC = 28  # high 4 quotient limbs (28..31)
+
+# ERRORS
+# =================================================================================================
+
+const ERR_MUL_DIV_DIVISION_BY_ZERO = "mul_div: division by zero"
+const ERR_MUL_DIV_QUOTIENT_OVERFLOW = "mul_div: quotient overflow"
+
+# PROCEDURES
+# =================================================================================================
+
+#! Computes floor(a * b / d) with an exact 256-bit intermediate product.
+#!
+#! Rounding: down (toward zero) — the pool-favoring choice when computing what the pool
+#! pays out (see the Rust oracle's rounding policy).
+#!
+#! Inputs:  [a0, a1, a2, a3, b0, b1, b2, b3, d0, d1, d2, d3]
+#! Outputs: [q0, q1, q2, q3]
+#!
+#! Where:
+#! - a0..a3 are the 32-bit limbs of factor a (a0 least significant).
+#! - b0..b3 are the 32-bit limbs of factor b (b0 least significant).
+#! - d0..d3 are the 32-bit limbs of the divisor d (d0 least significant).
+#! - q0..q3 are the 32-bit limbs of floor(a * b / d) (q0 least significant).
+#!
+#! Panics if:
+#! - d is zero.
+#! - the quotient does not fit in u128.
+#!
+#! Invocation: exec
+@locals(32)
+pub proc mul_div_floor(a: u128, b: u128, d: u128) -> u128
+    loc_storew_le.MULDIV_A_LOC dropw
+    loc_storew_le.MULDIV_B_LOC dropw
+    dupw exec.u128::eqz assertz.err=ERR_MUL_DIV_DIVISION_BY_ZERO
+    loc_storew_le.MULDIV_D_LOC dropw
+
+    # u = a * b (8 limbs)
+    push.4 locaddr.MULDIV_B_LOC push.4 locaddr.MULDIV_A_LOC locaddr.MULDIV_U_LOC
+    exec.wide::mul_limbs_ptr
+
+    # q = u / d
+    push.4 locaddr.MULDIV_D_LOC push.8 locaddr.MULDIV_U_LOC locaddr.MULDIV_Q_LOC
+    exec.wide::div_rem_ptr
+    drop
+    # => []
+
+    # quotient must fit in u128
+    push.4 locaddr.MULDIV_Q_HI_LOC exec.wide::sig_limbs
+    eq.0 assert.err=ERR_MUL_DIV_QUOTIENT_OVERFLOW
+
+    padw loc_loadw_le.MULDIV_Q_LOC
+    # => [q0, q1, q2, q3]
+end
+
+#! Computes ceil(a * b / d) with an exact 256-bit intermediate product.
+#!
+#! Rounding: up — the pool-favoring choice when computing what a user owes the pool
+#! (mirrors FullMath.mulDivRoundingUp).
+#!
+#! Inputs:  [a0, a1, a2, a3, b0, b1, b2, b3, d0, d1, d2, d3]
+#! Outputs: [q0, q1, q2, q3]
+#!
+#! Where:
+#! - a0..a3 are the 32-bit limbs of factor a (a0 least significant).
+#! - b0..b3 are the 32-bit limbs of factor b (b0 least significant).
+#! - d0..d3 are the 32-bit limbs of the divisor d (d0 least significant).
+#! - q0..q3 are the 32-bit limbs of ceil(a * b / d) (q0 least significant).
+#!
+#! Panics if:
+#! - d is zero.
+#! - the quotient does not fit in u128.
+#!
+#! Invocation: exec
+@locals(32)
+pub proc mul_div_ceil(a: u128, b: u128, d: u128) -> u128
+    loc_storew_le.MULDIV_A_LOC dropw
+    loc_storew_le.MULDIV_B_LOC dropw
+    dupw exec.u128::eqz assertz.err=ERR_MUL_DIV_DIVISION_BY_ZERO
+    loc_storew_le.MULDIV_D_LOC dropw
+
+    # u = a * b (8 limbs)
+    push.4 locaddr.MULDIV_B_LOC push.4 locaddr.MULDIV_A_LOC locaddr.MULDIV_U_LOC
+    exec.wide::mul_limbs_ptr
+
+    # q = u / d, rounded up over the full 8-limb quotient (mirroring the oracle's
+    # add_one over the wide buffer before the fit check)
+    push.4 locaddr.MULDIV_D_LOC push.8 locaddr.MULDIV_U_LOC locaddr.MULDIV_Q_LOC
+    exec.wide::div_rem_ptr
+    if.true
+        push.8 locaddr.MULDIV_Q_LOC exec.wide::inc_limbs
+    end
+    # => []
+
+    # quotient must fit in u128
+    push.4 locaddr.MULDIV_Q_HI_LOC exec.wide::sig_limbs
+    eq.0 assert.err=ERR_MUL_DIV_QUOTIENT_OVERFLOW
+
+    padw loc_loadw_le.MULDIV_Q_LOC
+    # => [q0, q1, q2, q3]
+end

@@ -1,0 +1,28 @@
+[package]
+name = "amm-math-masm"
+version = "0.1.0"
+edition = "2021"
+description = "Hand-written MASM port of the amm-math library, verified bit-equal against the Rust oracle"
+
+[dependencies]
+miden-assembly = "0.23"
+miden-core-lib = "0.23"
+miden-processor = "0.23"
+miden-protocol = "0.15"
+
+[dev-dependencies]
+amm-math = { path = "../amm-math" }
+rand = "0.9"
+rand_chacha = "0.9"
+primitive-types = "0.13"
+
+# This crate is its own workspace root (contracts/ crates are excluded from the
+# project workspace), so profile overrides here take effect. In-VM property
+# tests are compute-heavy; keep dependencies optimized even in dev builds.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[workspace]

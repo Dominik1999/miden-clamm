@@ -1,0 +1,17 @@
+[package]
+name = "bench-note"
+version = "0.1.0"
+
+[lib]
+kind = "note"
+# Notes export a package-derived interface (`miden-<package>`), matching the `#[note]` macro.
+namespace = "miden:bench-note/miden-bench-note@0.1.0"
+
+[dependencies]
+miden-core = "*"
+miden-protocol = "*"
+math-bench = { path = "../math-bench" }
+
+# WIT for the account component this note calls, produced by building math-bench.
+[package.metadata.miden.dependencies]
+math-bench = { wit = "../math-bench/target/generated-wit/" }
