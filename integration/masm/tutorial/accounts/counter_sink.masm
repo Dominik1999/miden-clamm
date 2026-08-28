@@ -1,0 +1,100 @@
+use miden::protocol::active_account
+use miden::protocol::active_note
+use miden::protocol::native_account
+use miden::protocol::note
+use miden::protocol::output_note
+use miden::core::crypto::hashes::poseidon2
+use miden::core::word
+use miden::core::sys
+
+const COUNTER_SLOT = word("miden::tutorials::counter")
+const P2ID_ROOT_SLOT = word("miden::tutorials::p2id_root")
+const MAP_SLOT = word("miden::tutorials::map")
+const NOTE_TYPE_PUBLIC = 1
+
+const EM_P2ID_STORAGE = 0
+const EM_P2ID_STORAGE_PREFIX = 1
+const EM_SERIAL = 4
+const EM_SALT = 8
+
+#! Inputs:  []
+#! Outputs: [count]
+pub proc get_count
+    push.COUNTER_SLOT[0..2] exec.active_account::get_item
+    exec.sys::truncate_stack
+end
+
+#! Inputs:  []
+#! Outputs: []
+pub proc increment_count
+    push.COUNTER_SLOT[0..2] exec.active_account::get_item
+    add.1
+    push.COUNTER_SLOT[0..2] exec.native_account::set_item
+    exec.sys::truncate_stack
+end
+
+#! Kitchen-sink network procedure approximating the CLAMM pool mint trace:
+#! heavy u32/bitwise/range work, 20 storage-map writes, 30 Poseidon2 hashes,
+#! and a public P2ID-shaped output note, then a counter increment.
+#! Inputs:  []
+#! Outputs: []
+@locals(12)
+pub proc increment_emit
+    # --- u32 / bitwise / range-checker load (~3000 iterations) ---
+    push.8000
+    dup neq.0
+    while.true
+        sub.1
+        push.0x0F0F0F0F push.0x12345678 u32and drop
+        push.0xFFFF0000 push.0x89ABCDEF u32xor drop
+        push.1234567 push.89 u32divmod drop drop
+        dup neq.0
+    end
+    drop
+    # --- 20 storage-map writes (SMT) ---
+    push.20
+    dup neq.0
+    while.true
+        sub.1
+        push.9 push.9 push.9 push.9
+        dup.4 push.8 push.8 push.8
+        push.MAP_SLOT[0..2]
+        exec.native_account::set_map_item
+        dropw
+        dup neq.0
+    end
+    drop
+    # --- 30 Poseidon2 hashes over 5-felt preimages ---
+    exec.active_note::get_serial_number
+    loc_storew_le.EM_SERIAL dropw
+    push.30
+    dup neq.0
+    while.true
+        sub.1
+        dup loc_store.EM_SALT
+        push.5 locaddr.EM_SERIAL
+        exec.poseidon2::hash_elements
+        dropw
+        dup neq.0
+    end
+    drop
+    # --- emit a public P2ID note like the pool does ---
+    exec.active_note::get_sender
+    loc_store.EM_P2ID_STORAGE_PREFIX
+    loc_store.EM_P2ID_STORAGE
+    push.7 loc_store.EM_SALT
+    push.5 locaddr.EM_SERIAL
+    exec.poseidon2::hash_elements
+    push.P2ID_ROOT_SLOT[0..2] exec.active_account::get_item
+    swapw
+    push.2 locaddr.EM_P2ID_STORAGE
+    exec.note::compute_and_store_recipient
+    push.NOTE_TYPE_PUBLIC push.0
+    exec.output_note::create
+    drop
+    # --- increment ---
+    push.COUNTER_SLOT[0..2] exec.active_account::get_item
+    add.1
+    push.COUNTER_SLOT[0..2] exec.native_account::set_item
+    exec.sys::truncate_stack
+end

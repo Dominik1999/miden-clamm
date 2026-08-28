@@ -1,0 +1,69 @@
+use miden::protocol::active_account
+use miden::protocol::active_note
+use miden::protocol::native_account
+use miden::protocol::note
+use miden::protocol::output_note
+use miden::core::crypto::hashes::poseidon2
+use miden::core::word
+use miden::core::sys
+
+const COUNTER_SLOT = word("miden::tutorials::counter")
+const P2ID_ROOT_SLOT = word("miden::tutorials::p2id_root")
+const NOTE_TYPE_PUBLIC = 1
+
+# locals layout for increment_emit
+const EM_P2ID_STORAGE = 0
+const EM_P2ID_STORAGE_PREFIX = 1
+const EM_SERIAL = 4
+const EM_SALT = 8
+
+#! Inputs:  []
+#! Outputs: [count]
+pub proc get_count
+    push.COUNTER_SLOT[0..2] exec.active_account::get_item
+    exec.sys::truncate_stack
+end
+
+#! Inputs:  []
+#! Outputs: []
+pub proc increment_count
+    push.COUNTER_SLOT[0..2] exec.active_account::get_item
+    add.1
+    push.COUNTER_SLOT[0..2] exec.native_account::set_item
+    exec.sys::truncate_stack
+end
+
+#! Emits a real public P2ID output note exactly the way the CLAMM pool does
+#! (Poseidon2-derived serial, P2ID root from storage, recipient computed and
+#! stored via note::compute_and_store_recipient), then increments the counter.
+#! Only invoked from the network note (ntx-builder execution context).
+#! Inputs:  []
+#! Outputs: []
+@locals(12)
+pub proc increment_emit
+    # P2ID note storage = [sender_suffix, sender_prefix] of the note sender
+    exec.active_note::get_sender
+    loc_store.EM_P2ID_STORAGE_PREFIX
+    loc_store.EM_P2ID_STORAGE
+    # serial' = Poseidon2(input_serial || salt) over a 5-felt preimage
+    exec.active_note::get_serial_number
+    loc_storew_le.EM_SERIAL dropw
+    push.7 loc_store.EM_SALT
+    push.5 locaddr.EM_SERIAL
+    exec.poseidon2::hash_elements
+    # => [SERIAL']
+    push.P2ID_ROOT_SLOT[0..2] exec.active_account::get_item
+    # => [SCRIPT_ROOT, SERIAL']
+    swapw
+    # => [SERIAL', SCRIPT_ROOT]
+    push.2 locaddr.EM_P2ID_STORAGE
+    exec.note::compute_and_store_recipient
+    # => [RECIPIENT]
+    push.NOTE_TYPE_PUBLIC push.0
+    exec.output_note::create
+    drop
+    push.COUNTER_SLOT[0..2] exec.active_account::get_item
+    add.1
+    push.COUNTER_SLOT[0..2] exec.native_account::set_item
+    exec.sys::truncate_stack
+end

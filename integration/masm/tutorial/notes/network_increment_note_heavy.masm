@@ -1,0 +1,14 @@
+use external_contract::counter_contract
+use miden::core::crypto::hashes::poseidon2
+
+#! Inputs:  []
+#! Outputs: []
+@note_script
+pub proc main
+    push.1 push.2 push.3 push.4 push.0 mem_storew_le dropw
+    push.5 push.0 mem_store
+    push.5 push.0
+    exec.poseidon2::hash_elements
+    dropw
+    call.counter_contract::increment_count
+end

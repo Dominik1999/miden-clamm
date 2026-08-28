@@ -7,7 +7,7 @@ use cargo_miden::run;
 use miden_client::{
     account::{
         component::{BasicWallet, InitStorageData, NoAuth},
-        Account, AccountBuilder, AccountComponent, AccountType, StorageSlotName,
+        Account, AccountBuilder, AccountComponent, AccountType,
     },
     auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig},
     builder::ClientBuilder,

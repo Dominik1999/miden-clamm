@@ -87,17 +87,25 @@ cargo run -p integration --bin testnet_smoke --release   # fund, mint, swap thro
   (`https://tx-prover.testnet.miden.io`) proves user-side transactions, so
   the hosted frontend needs no proxy — only the COOP/COEP headers in
   `frontend/vercel.json`.
-- **Servicing status (measured 2026-08-27):** the public testnet operator
-  does **not** run an ntx-builder that services arbitrary network accounts.
-  The pool deployed fine by transaction and all user-side transactions
-  (faucet mints, wallet funding, note publishing) commit in ~6-8s, but a
-  committed mint note against the pool was never consumed (600s+
-  observation window). The pool is therefore **deployed but passive** on
-  testnet: the hosted frontend shows live pool state and lets you submit
-  notes, with a persistent notice (`VITE_CLAMM_NTX_PASSIVE`) that notes
-  will sit pending and can be reclaimed after their deadline. Full
-  end-to-end execution runs on the local stack above, whose ntx-builder
-  services the pool within seconds.
+- **Testnet status (measured 2026-08-28):**
+  - Network notes must carry `NoteTag::with_account_target(pool)` — the
+    testnet ntx-builder discovers notes by tag routing, so untagged notes
+    are silently never serviced. **Fixed** everywhere notes are built
+    (Rust builders and the TS serializer, byte-identical; goldens pinned).
+  - With the tag in place the ntx-builder *does* pick the notes up, but
+    the public testnet's network-transaction prover currently **rejects
+    this pool's proofs** with `constraint mismatch: quotient * vanishing
+    != folded constraints`. Reproducible via
+    `export_web_artifacts --deploy --network testnet` + `testnet_smoke`;
+    the diagnostic binaries `note_status`, `prover_probe`, `reclaim_note`,
+    and `tutorial_repro` narrow it down (testnet-side bug — reported to
+    the node team).
+  - Until that is fixed the pool is **deployed but passive** on testnet:
+    the hosted frontend shows live pool state and lets you submit notes,
+    with a persistent notice (`VITE_CLAMM_NTX_PASSIVE`) that notes will
+    sit pending and can be reclaimed after their deadline. Full
+    end-to-end execution runs on the local stack above, whose
+    ntx-builder services the pool within seconds.
 
 ## Status
 

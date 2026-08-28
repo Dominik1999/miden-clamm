@@ -1,0 +1,10 @@
+use external_contract::counter_contract
+use miden::standards::wallets::basic->wallet
+
+#! Inputs:  []
+#! Outputs: []
+@note_script
+pub proc main
+    exec.wallet::add_assets_to_account
+    call.counter_contract::increment_emit
+end
