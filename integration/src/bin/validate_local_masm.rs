@@ -1281,9 +1281,13 @@ fn build_amm_note(
 ) -> Result<Note> {
     let attachment = NetworkAccountTarget::new(pool, NoteExecutionHint::always())
         .context("building NetworkAccountTarget attachment")?;
+    // Tag routing: the ntx-builder discovers network notes by
+    // `NoteTag::with_account_target(pool)`; without it the note is silently
+    // orphaned (see testnet_smoke.rs).
     let note = NoteBuilder::new(sender, rng)
         .script(script.clone())
         .note_type(NoteType::Public)
+        .tag(NoteTag::with_account_target(pool).into())
         .attachment(attachment)
         .add_assets(assets)
         .note_storage(storage)?

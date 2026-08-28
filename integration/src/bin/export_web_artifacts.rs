@@ -53,7 +53,7 @@ use miden_client::auth::{AuthSchemeId, AuthSecretKey, AuthSingleSig};
 use miden_client::builder::ClientBuilder;
 use miden_client::crypto::RandomCoin;
 use miden_client::keystore::{FilesystemKeyStore, Keystore};
-use miden_client::note::{Note, NoteType};
+use miden_client::note::{Note, NoteTag, NoteType};
 use miden_client::rpc::{Endpoint, GrpcClient, NodeRpcClient};
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client::utils::Serializable;
@@ -257,9 +257,15 @@ fn build_golden_note(
     ]);
     // NoteBuilder::new derives a random serial from the rng; override it.
     let mut rng = RandomCoin::new(Word::from([9u32, 9, 9, 9]));
+    // The testnet ntx-builder discovers notes by TAG routing: network notes
+    // must carry `NoteTag::with_account_target(pool)` (pool-derived, NOT the
+    // NoteBuilder default derived from the sender) or they are silently
+    // orphaned. The golden fixtures pin this so the TS serializer stays
+    // byte-identical.
     let note = NoteBuilder::new(sender, &mut rng)
         .script(note_script(kind).clone())
         .note_type(NoteType::Public)
+        .tag(NoteTag::with_account_target(pool).into())
         .attachment(attachment)
         .add_assets(assets)
         .note_storage(storage)?

@@ -712,8 +712,7 @@ async fn main() -> Result<()> {
     let t_adv = Instant::now();
     let refund_serial = expected_p2id_serial(&bad_note, SALT_SWAP_REFUND);
     let refund_recipient = P2idNoteStorage::new(user_b.id()).into_recipient(refund_serial);
-    let mut refund_note: Option<Note> = None;
-    loop {
+    let refund_note = loop {
         if t_adv.elapsed() > NTX_TIMEOUT {
             bail!("adversarial note was not refund-consumed within timeout; attempts: {attempts_seen:?}");
         }
@@ -731,11 +730,10 @@ async fn main() -> Result<()> {
         // Refund appears once the pool consumes-and-refunds at the deadline.
         client.sync_state().await?;
         if let Some(note) = find_note_by_recipient(&client, user_b.id(), refund_recipient.digest()).await? {
-            refund_note = Some(note);
-            break;
+            break note;
         }
         tokio::time::sleep(POLL_INTERVAL).await;
-    }
+    };
     let adv_elapsed = t_adv.elapsed();
     let failed_attempts: Vec<_> = attempts_seen.iter().filter(|(c, _, _)| *c > 0).collect();
     println!(
@@ -773,7 +771,6 @@ async fn main() -> Result<()> {
     assert_pool_state(&pool_now, &sim)?;
 
     // Consume the refund and verify the full input came back.
-    let refund_note = refund_note.expect("set on loop exit");
     let bal_before = user_balance(&client, user_b.id(), token0).await?;
     submit_and_confirm(
         &mut client,
@@ -984,9 +981,13 @@ fn build_amm_note(
 ) -> Result<Note> {
     let attachment = NetworkAccountTarget::new(pool, NoteExecutionHint::always())
         .context("building NetworkAccountTarget attachment")?;
+    // Tag routing: the ntx-builder discovers network notes by
+    // `NoteTag::with_account_target(pool)`; without it the note is silently
+    // orphaned (see testnet_smoke.rs).
     let note = NoteBuilder::new(sender, rng)
         .package((**package).clone())
         .note_type(NoteType::Public)
+        .tag(NoteTag::with_account_target(pool).into())
         .attachment(attachment)
         .add_assets(assets)
         .note_storage(storage)?

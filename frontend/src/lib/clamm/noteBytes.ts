@@ -37,7 +37,7 @@ export interface ClammNoteAsset {
 
 export interface ClammNoteParams {
   senderHex: string;
-  /** Note tag as u32 (use `accountTargetTag(senderHex)` for parity with the validated flow). */
+  /** Note tag as u32: `accountTargetTag(poolHex)` — pool-targeted, required for ntx-builder discovery. */
   tag: number;
   assets: ClammNoteAsset[];
   /** Serialized NoteScript bytes (the exported `*.notescript` file contents). */

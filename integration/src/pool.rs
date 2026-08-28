@@ -571,7 +571,7 @@ pub mod testbed {
         asset::{AssetCallbackFlag, AssetVaultKey, FungibleAsset},
         auth::AuthSchemeId,
         crypto::{Poseidon2, RandomCoin},
-        note::{Note, NoteId, NoteScript},
+        note::{Note, NoteId, NoteScript, NoteTag},
         transaction::RawOutputNote,
         Felt, Word,
     };
@@ -1089,9 +1089,15 @@ pub mod testbed {
             let attachment =
                 NetworkAccountTarget::new(self.pool.id(), NoteExecutionHint::always())
                     .context("building NetworkAccountTarget attachment")?;
+            // The testnet ntx-builder discovers notes by TAG routing, not
+            // (only) by attachment scanning: a network note must carry
+            // `NoteTag::with_account_target(pool)` or it is silently orphaned.
+            // MockChain consumption ignores the tag, but the testbed mirrors
+            // the real deployment byte-for-byte.
             let note = NoteBuilder::new(sender, &mut self.rng_swap)
                 .script(self.scripts.swap.clone())
                 .note_type(NoteType::Public)
+                .tag(NoteTag::with_account_target(self.pool.id()).into())
                 .attachment(attachment)
                 .add_assets([FungibleAsset::new(faucet, amount_in)?.into()])
                 .note_storage(storage)?

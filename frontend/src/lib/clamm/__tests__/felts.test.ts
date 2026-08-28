@@ -52,9 +52,12 @@ describe("accountIdParts", () => {
 });
 
 describe("accountTargetTag", () => {
-  it("matches the golden NoteTag::with_account_target value", () => {
+  it("matches the golden NoteTag::with_account_target(pool) value", () => {
     const swap = golden.notes.find((n) => n.kind === "swap")!;
-    expect(accountTargetTag(swap.senderHex)).toBe(swap.tag);
+    // Network notes are tagged with the POOL target (ntx-builder tag
+    // routing), not the sender-derived default.
+    expect(accountTargetTag(golden.accounts.pool.hex)).toBe(swap.tag);
+    expect(accountTargetTag(swap.senderHex)).not.toBe(swap.tag);
   });
 
   it("keeps only the top 14 bits of the prefix's high u32", () => {

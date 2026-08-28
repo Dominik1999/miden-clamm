@@ -84,9 +84,11 @@ async function fetchScriptBytes(kind: ClammNoteKind): Promise<Uint8Array> {
  * Builds and publishes CLAMM pool notes, mirroring validate_local_masm's
  * `build_amm_note` + publish flow:
  *
- * 1. Serialize the full note in TS (public note, `NoteTag::with_account_target`
- *    tag, note storage per DESIGN Part 2, scheme-2 NetworkAccountTarget
- *    attachment targeting the pool) and load it via `Note.deserialize` —
+ * 1. Serialize the full note in TS (public note, pool-targeted
+ *    `NoteTag::with_account_target(pool)` tag — required for ntx-builder
+ *    discovery — note storage per DESIGN Part 2, scheme-2
+ *    NetworkAccountTarget attachment targeting the pool) and load it via
+ *    `Note.deserialize` —
  *    the JS `Note` constructor cannot carry attachments on the 0.15 surface.
  * 2. Publish it as the wallet's own output note and submit through the
  *    configured (remote) prover.
@@ -130,7 +132,10 @@ export function useSubmitPoolNote(
           const serial = randomSerial();
           const bytes = serializeClammNote({
             senderHex: walletId,
-            tag: accountTargetTag(walletId),
+            // Tag routing: the testnet ntx-builder discovers network notes by
+            // `NoteTag::with_account_target(POOL)`. A sender-derived tag
+            // leaves the note silently orphaned.
+            tag: accountTargetTag(deployment.pool.id),
             assets,
             scriptBytes,
             storage,

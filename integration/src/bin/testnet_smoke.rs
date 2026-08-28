@@ -176,9 +176,14 @@ fn build_amm_note(
 ) -> Result<Note> {
     let attachment = NetworkAccountTarget::new(pool, NoteExecutionHint::always())
         .context("building NetworkAccountTarget attachment")?;
+    // The testnet ntx-builder discovers notes by TAG routing, not (only) by
+    // attachment scanning: without the account-target tag the note is
+    // silently orphaned (per the network-transactions tutorial; confirmed by
+    // our first deployment sitting unserviced for 537 blocks).
     Ok(NoteBuilder::new(sender, rng)
         .script(note_script(kind).clone())
         .note_type(NoteType::Public)
+        .tag(NoteTag::with_account_target(pool).into())
         .attachment(attachment)
         .add_assets(assets)
         .note_storage(storage)?
